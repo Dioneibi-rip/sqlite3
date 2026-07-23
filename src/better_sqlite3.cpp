@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <mutex>
+#include <deque>
 #include <sqlite3.h>
 #include <napi.h>
 

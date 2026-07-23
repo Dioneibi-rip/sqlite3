@@ -18,11 +18,13 @@ Database::Database(const Napi::CallbackInfo& info) :
 	unsafe_mode(false),
 	was_js_error(false),
 	has_logger(false),
+	async_busy(false),
 	iterators(0),
 	addon(static_cast<Addon*>(info.Data())),
 	logger(),
 	stmts(),
-	backups() {
+	backups(),
+	async_queue() {
 	napi_status status = napi_type_tag_object(info.Env(), info.This(), &TYPE_TAG);
 	assert(status == napi_ok); ((void)status);
 	JS_new(info);
@@ -121,10 +123,79 @@ void Database::FreeSerialization(Napi::Env env, char* data) {
 	sqlite3_free(data);
 }
 
+void Database::EnqueueAsync(QueuedAsyncWorker* worker) {
+	if (async_busy) {
+		async_queue.push_back(worker);
+	} else {
+		async_busy = true;
+		worker->QueueWork();
+	}
+}
+
+void Database::FinishAsync() {
+	if (!async_queue.empty()) {
+		QueuedAsyncWorker* worker = async_queue.front();
+		async_queue.pop_front();
+		worker->QueueWork();
+	} else {
+		async_busy = false;
+	}
+}
+
+class ExecAsyncWorker : public QueuedAsyncWorker {
+public:
+	ExecAsyncWorker(Napi::Env env, Database* db, Napi::Object owner, std::string source)
+		: QueuedAsyncWorker(env, db, owner), source(std::move(source)), status(SQLITE_OK), code(SQLITE_OK) {}
+
+	void Execute() override {
+		const char* sql = source.c_str();
+		const char* tail;
+		sqlite3_stmt* handle;
+		sqlite3* const db_handle = db->GetHandle();
+
+		for (;;) {
+			while (IS_SKIPPED(*sql)) ++sql;
+			status = sqlite3_prepare_v2(db_handle, sql, -1, &handle, &tail);
+			sql = tail;
+			if (status != SQLITE_OK) break;
+			if (!handle) break;
+			do status = sqlite3_step(handle);
+			while (status == SQLITE_ROW);
+			status = sqlite3_finalize(handle);
+			if (status != SQLITE_OK) break;
+		}
+
+		if (status != SQLITE_OK) {
+			code = sqlite3_extended_errcode(db_handle);
+			message = sqlite3_errmsg(db_handle);
+			SetError(message);
+		}
+	}
+
+	void OnOK() override {
+		deferred.Resolve(Env().Undefined());
+		FinishQueue();
+	}
+
+	void OnError(const Napi::Error& error) override {
+		Napi::Object err = error.Value();
+		err.Set("code", db->GetAddon()->cs.Code(Env(), code));
+		deferred.Reject(err);
+		FinishQueue();
+	}
+
+private:
+	std::string source;
+	std::string message;
+	int status;
+	int code;
+};
+
 INIT(Database::Init) {
 	return DefineClass(env, "Database", {
 		PrototypeMethod<Database, &Database::JS_prepare>("prepare", addon),
 		PrototypeMethod<Database, &Database::JS_exec>("exec", addon),
+		PrototypeMethod<Database, &Database::JS_execAsync>("execAsync", addon),
 		PrototypeMethod<Database, &Database::JS_backup>("backup", addon),
 		PrototypeMethod<Database, &Database::JS_serialize>("serialize", addon),
 		PrototypeMethod<Database, &Database::JS_function>("function", addon),
@@ -253,6 +324,22 @@ NODE_METHOD(Database::JS_exec) {
 		db->ThrowDatabaseError(env);
 	}
 	return env.Undefined();
+}
+
+
+NODE_METHOD(Database::JS_execAsync) {
+	Database* db = ::Unwrap<Database>(info.This());
+	REQUIRE_ARGUMENT_STRING(first, Napi::String source);
+	REQUIRE_DATABASE_OPEN(db);
+	if (db->busy) return ThrowTypeError(info.Env(), "This database connection is busy executing a query");
+	REQUIRE_DATABASE_NO_ITERATORS_UNLESS_UNSAFE(db);
+	if (db->has_logger) return ThrowTypeError(info.Env(), "execAsync() cannot be used while verbose logging is enabled");
+
+	Napi::Env env = info.Env();
+	ExecAsyncWorker* worker = new ExecAsyncWorker(env, db, info.This().As<Napi::Object>(), source.Utf8Value());
+	Napi::Promise promise = worker->Promise();
+	db->EnqueueAsync(worker);
+	return promise;
 }
 
 NODE_METHOD(Database::JS_backup) {

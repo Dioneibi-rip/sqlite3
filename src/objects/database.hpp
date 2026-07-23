@@ -1,3 +1,5 @@
+class QueuedAsyncWorker;
+
 class Database : public Napi::ObjectWrap<Database> {
 public:
 
@@ -40,6 +42,10 @@ public:
 	inline void AddBackup(Backup* backup) { backups.insert(backups.end(), backup); }
 	inline void RemoveBackup(Backup* backup) { backups.erase(backup); }
 
+	// Queue asynchronous write workers so a connection is never used concurrently.
+	void EnqueueAsync(QueuedAsyncWorker* worker);
+	void FinishAsync();
+
 	// A view for Statements to see and modify Database state.
 	// The order of these fields must exactly match their actual order.
 	struct State {
@@ -49,6 +55,7 @@ public:
 		const bool unsafe_mode;
 		bool was_js_error;
 		const bool has_logger;
+		bool async_busy;
 		unsigned short iterators;
 		Addon* const addon;
 	};
@@ -67,6 +74,7 @@ private:
 	NODE_METHOD(JS_new);
 	static NODE_METHOD(JS_prepare);
 	static NODE_METHOD(JS_exec);
+	static NODE_METHOD(JS_execAsync);
 	static NODE_METHOD(JS_backup);
 	static NODE_METHOD(JS_serialize);
 	static NODE_METHOD(JS_function);
@@ -92,9 +100,27 @@ private:
 	bool unsafe_mode;
 	bool was_js_error;
 	bool has_logger;
+	bool async_busy;
 	unsigned short iterators;
 	Addon* const addon;
 	Napi::Reference<Napi::Value> logger;
 	std::set<Statement*, CompareStatement> stmts;
 	std::set<Backup*, CompareBackup> backups;
+	std::deque<QueuedAsyncWorker*> async_queue;
+};
+
+class QueuedAsyncWorker : public Napi::AsyncWorker {
+public:
+	QueuedAsyncWorker(Napi::Env env, Database* db, Napi::Object owner)
+		: Napi::AsyncWorker(env), deferred(Napi::Promise::Deferred::New(env)), db(db), owner(Napi::Persistent(owner)) {}
+
+	Napi::Promise Promise() { return deferred.Promise(); }
+	void QueueWork() { Napi::AsyncWorker::Queue(); }
+
+protected:
+	void FinishQueue() { db->FinishAsync(); }
+
+	Napi::Promise::Deferred deferred;
+	Database* db;
+	Napi::ObjectReference owner;
 };
