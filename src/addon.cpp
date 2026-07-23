@@ -46,6 +46,7 @@ struct Addon {
 
 	Napi::FunctionReference Statement;
 	Napi::FunctionReference StatementIterator;
+	Napi::FunctionReference StatementAsyncIterator;
 	Napi::FunctionReference Backup;
 	Napi::FunctionReference SqliteError;
 	Napi::FunctionReference ArrayFactory;

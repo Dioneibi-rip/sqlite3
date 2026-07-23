@@ -214,6 +214,192 @@ namespace {
 		bool bound_object;
 	};
 
+	struct ResultValue {
+		enum Type { Null, Integer, Float, Text, Blob } type;
+		sqlite3_int64 integer;
+		double number;
+		std::string text;
+		std::vector<uint8_t> blob;
+
+		ResultValue() : type(Null), integer(0), number(0) {}
+	};
+
+	struct ResultRow {
+		std::vector<ResultValue> values;
+	};
+
+	struct ResultColumn {
+		std::string name;
+		std::string table;
+	};
+
+	static ResultValue CaptureColumnValue(sqlite3_stmt* handle, int column) {
+		ResultValue value;
+		switch (sqlite3_column_type(handle, column)) {
+			case SQLITE_INTEGER:
+				value.type = ResultValue::Integer;
+				value.integer = sqlite3_column_int64(handle, column);
+				break;
+			case SQLITE_FLOAT:
+				value.type = ResultValue::Float;
+				value.number = sqlite3_column_double(handle, column);
+				break;
+			case SQLITE_TEXT: {
+				value.type = ResultValue::Text;
+				const char* data = reinterpret_cast<const char*>(sqlite3_column_text(handle, column));
+				int size = sqlite3_column_bytes(handle, column);
+				if (data != NULL && size > 0) value.text.assign(data, data + size);
+				break;
+			}
+			case SQLITE_BLOB: {
+				value.type = ResultValue::Blob;
+				const uint8_t* data = static_cast<const uint8_t*>(sqlite3_column_blob(handle, column));
+				int size = sqlite3_column_bytes(handle, column);
+				if (data != NULL && size > 0) value.blob.assign(data, data + size);
+				break;
+			}
+			default:
+				value.type = ResultValue::Null;
+				break;
+		}
+		return value;
+	}
+
+	static Napi::Value ResultValueToJS(Napi::Env env, const ResultValue& value, bool safe_ints) {
+		switch (value.type) {
+			case ResultValue::Integer:
+				if (safe_ints) return Napi::BigInt::New(env, (int64_t)value.integer);
+				return Napi::Number::New(env, (double)value.integer);
+			case ResultValue::Float:
+				return Napi::Number::New(env, value.number);
+			case ResultValue::Text:
+				return StringFromUtf8(env, value.text.c_str(), value.text.length());
+			case ResultValue::Blob:
+				return Napi::Buffer<uint8_t>::Copy(env, value.blob.data(), value.blob.size());
+			default:
+				return env.Null();
+		}
+	}
+
+	class AsyncReaderWorker : public QueuedAsyncWorker {
+	public:
+		AsyncReaderWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound, bool single)
+			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), single(single), safe_ints(stmt->IsSafeIntegers()), mode(stmt->GetMode()), column_count(0), status(SQLITE_OK), code(SQLITE_OK) {}
+
+		void Execute() override {
+			sqlite3_stmt* handle = stmt->GetHandle();
+			sqlite3* db_handle = db->GetHandle();
+			if (!bound) {
+				for (const AsyncBindValue& value : values) {
+					status = Bind(handle, value);
+					if (status != SQLITE_OK) break;
+				}
+			}
+			if (status == SQLITE_OK) {
+				column_count = sqlite3_column_count(handle);
+				CaptureColumns(handle);
+				while ((status = sqlite3_step(handle)) == SQLITE_ROW) {
+					ResultRow row;
+					row.values.reserve(column_count);
+					for (int i = 0; i < column_count; ++i) row.values.emplace_back(CaptureColumnValue(handle, i));
+					rows.emplace_back(std::move(row));
+					if (single) break;
+				}
+				if (status == SQLITE_ROW || status == SQLITE_DONE) status = sqlite3_reset(handle);
+				else sqlite3_reset(handle);
+			}
+			if (status != SQLITE_OK) {
+				code = sqlite3_extended_errcode(db_handle);
+				message = sqlite3_errmsg(db_handle);
+				SetError(message);
+			}
+			if (!bound) sqlite3_clear_bindings(handle);
+		}
+
+		void OnOK() override {
+			if (single) {
+				deferred.Resolve(rows.empty() ? Env().Undefined() : RowToJS(rows[0]));
+			} else {
+				Napi::Array result = Napi::Array::New(Env(), rows.size());
+				for (size_t i = 0; i < rows.size(); ++i) result.Set(i, RowToJS(rows[i]));
+				deferred.Resolve(result);
+			}
+			FinishQueue();
+		}
+
+		void OnError(const Napi::Error& error) override {
+			Napi::Object err = error.Value();
+			err.Set("code", db->GetAddon()->cs.Code(Env(), code));
+			deferred.Reject(err);
+			FinishQueue();
+		}
+
+	private:
+		int Bind(sqlite3_stmt* handle, const AsyncBindValue& value) {
+			switch (value.type) {
+				case AsyncBindValue::Null: return sqlite3_bind_null(handle, value.index);
+				case AsyncBindValue::Double: return sqlite3_bind_double(handle, value.index, value.number);
+				case AsyncBindValue::Int64: return sqlite3_bind_int64(handle, value.index, value.integer);
+				case AsyncBindValue::Text: return sqlite3_bind_text(handle, value.index, value.bytes.c_str(), value.bytes.length(), SQLITE_TRANSIENT);
+				case AsyncBindValue::Blob: return sqlite3_bind_blob(handle, value.index, value.bytes.data(), value.bytes.length(), SQLITE_TRANSIENT);
+			}
+			return SQLITE_MISUSE;
+		}
+
+		void CaptureColumns(sqlite3_stmt* handle) {
+			columns.clear();
+			columns.reserve(column_count);
+			for (int i = 0; i < column_count; ++i) {
+				const char* name = sqlite3_column_name(handle, i);
+				const char* table = sqlite3_column_table_name(handle, i);
+				ResultColumn column;
+				column.name = name == NULL ? "" : name;
+				column.table = table == NULL ? "$" : table;
+				columns.emplace_back(std::move(column));
+			}
+		}
+
+		Napi::Value RowToJS(const ResultRow& row) {
+			Napi::Env env = Env();
+			if (mode == Data::PLUCK) return ResultValueToJS(env, row.values[0], safe_ints);
+			if (mode == Data::RAW) {
+				Napi::Array array = Napi::Array::New(env, row.values.size());
+				for (size_t i = 0; i < row.values.size(); ++i) array.Set(i, ResultValueToJS(env, row.values[i], safe_ints));
+				return array;
+			}
+			Napi::Object object = Napi::Object::New(env);
+			for (size_t i = 0; i < row.values.size(); ++i) {
+				Napi::String key = Napi::String::New(env, columns[i].name);
+				Napi::Value value = ResultValueToJS(env, row.values[i], safe_ints);
+				if (mode == Data::EXPAND) {
+					Napi::String table = Napi::String::New(env, columns[i].table);
+					if (object.HasOwnProperty(table)) object.Get(table).As<Napi::Object>().Set(key, value);
+					else {
+						Napi::Object nested = Napi::Object::New(env);
+						object.Set(table, nested);
+						nested.Set(key, value);
+					}
+				} else {
+					object.Set(key, value);
+				}
+			}
+			return object;
+		}
+
+		Statement* stmt;
+		std::vector<AsyncBindValue> values;
+		bool bound;
+		bool single;
+		bool safe_ints;
+		char mode;
+		int column_count;
+		std::vector<ResultColumn> columns;
+		std::vector<ResultRow> rows;
+		int status;
+		int code;
+		std::string message;
+	};
+
 	class RunAsyncWorker : public QueuedAsyncWorker {
 	public:
 		RunAsyncWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound)
@@ -284,13 +470,268 @@ namespace {
 	};
 }
 
+
+namespace {
+class StatementAsyncIterator : public Napi::ObjectWrap<StatementAsyncIterator> {
+public:
+	explicit StatementAsyncIterator(const Napi::CallbackInfo& info) :
+		Napi::ObjectWrap<StatementAsyncIterator>(info),
+		stmt(NULL),
+		handle(NULL),
+		db(NULL),
+		db_state(NULL),
+		bound(false),
+		safe_ints(false),
+		mode(Data::FLAT),
+		alive(false),
+		pending(false) {
+		napi_status status = napi_type_tag_object(info.Env(), info.This(), &TYPE_TAG);
+		assert(status == napi_ok); ((void)status);
+		JS_new(info);
+	}
+
+	~StatementAsyncIterator() {}
+
+	static const napi_type_tag TYPE_TAG;
+	static INIT(Init) {
+		return DefineClass(env, "StatementAsyncIterator", {
+			PrototypeMethod<StatementAsyncIterator, &StatementAsyncIterator::JS_next>("next", addon),
+			PrototypeMethod<StatementAsyncIterator, &StatementAsyncIterator::JS_return>("return", addon),
+			PrototypeSymbolMethod<StatementAsyncIterator, &StatementAsyncIterator::JS_symbolAsyncIterator>(Napi::Symbol::WellKnown(env, "asyncIterator"), addon),
+		}, addon);
+	}
+
+	Napi::Object DoneRecord(Napi::Env env) {
+		return NewRecord(env, env.Undefined(), true);
+	}
+
+	Napi::Object NewRecord(Napi::Env env, Napi::Value value, bool done) {
+		Addon* addon = db_state->addon;
+		napi_property_descriptor properties[2] = {};
+		properties[0].name = addon->cs.value.Value();
+		properties[0].value = value;
+		properties[0].attributes = DEFAULT_ATTRIBUTES;
+		properties[1].name = addon->cs.done.Value();
+		properties[1].value = Napi::Boolean::New(env, done);
+		properties[1].attributes = DEFAULT_ATTRIBUTES;
+		napi_value record;
+		napi_status status = napi_create_object(env, &record);
+		assert(status == napi_ok);
+		status = napi_define_properties(env, record, 2, properties);
+		assert(status == napi_ok); ((void)status);
+		return Napi::Object(env, record);
+	}
+
+	void Cleanup() {
+		if (!alive) return;
+		alive = false;
+		stmt->SetLocked(false);
+		db_state->iterators -= 1;
+		sqlite3_reset(handle);
+		if (!bound) sqlite3_clear_bindings(handle);
+	}
+
+private:
+	class NextWorker : public QueuedAsyncWorker {
+	public:
+		NextWorker(Napi::Env env, Database* db, Napi::Object owner, StatementAsyncIterator* iter)
+			: QueuedAsyncWorker(env, db, owner), iter(iter), status(SQLITE_OK), code(SQLITE_OK), has_row(false), done(false), safe_ints(iter->safe_ints), mode(iter->mode), column_count(0) {}
+
+		void Execute() override {
+			sqlite3_stmt* handle = iter->handle;
+			column_count = sqlite3_column_count(handle);
+			CaptureColumns(handle);
+			status = sqlite3_step(handle);
+			if (status == SQLITE_ROW) {
+				has_row = true;
+				row.values.reserve(column_count);
+				for (int i = 0; i < column_count; ++i) row.values.emplace_back(CaptureColumnValue(handle, i));
+			} else if (status == SQLITE_DONE) {
+				done = true;
+			} else {
+				code = sqlite3_extended_errcode(db->GetHandle());
+				message = sqlite3_errmsg(db->GetHandle());
+				SetError(message);
+			}
+		}
+
+		void OnOK() override {
+			iter->pending = false;
+			if (done) {
+				iter->Cleanup();
+				deferred.Resolve(iter->DoneRecord(Env()));
+			} else {
+				deferred.Resolve(iter->NewRecord(Env(), RowToJS(row), false));
+			}
+			FinishQueue();
+		}
+
+		void OnError(const Napi::Error& error) override {
+			iter->pending = false;
+			iter->Cleanup();
+			Napi::Object err = error.Value();
+			err.Set("code", db->GetAddon()->cs.Code(Env(), code));
+			deferred.Reject(err);
+			FinishQueue();
+		}
+
+	private:
+		void CaptureColumns(sqlite3_stmt* handle) {
+			columns.clear();
+			columns.reserve(column_count);
+			for (int i = 0; i < column_count; ++i) {
+				const char* name = sqlite3_column_name(handle, i);
+				const char* table = sqlite3_column_table_name(handle, i);
+				ResultColumn column;
+				column.name = name == NULL ? "" : name;
+				column.table = table == NULL ? "$" : table;
+				columns.emplace_back(std::move(column));
+			}
+		}
+
+		Napi::Value RowToJS(const ResultRow& row) {
+			Napi::Env env = Env();
+			if (mode == Data::PLUCK) return ResultValueToJS(env, row.values[0], safe_ints);
+			if (mode == Data::RAW) {
+				Napi::Array array = Napi::Array::New(env, row.values.size());
+				for (size_t i = 0; i < row.values.size(); ++i) array.Set(i, ResultValueToJS(env, row.values[i], safe_ints));
+				return array;
+			}
+			Napi::Object object = Napi::Object::New(env);
+			for (size_t i = 0; i < row.values.size(); ++i) {
+				Napi::String key = Napi::String::New(env, columns[i].name);
+				Napi::Value value = ResultValueToJS(env, row.values[i], safe_ints);
+				if (mode == Data::EXPAND) {
+					Napi::String table = Napi::String::New(env, columns[i].table);
+					if (object.HasOwnProperty(table)) object.Get(table).As<Napi::Object>().Set(key, value);
+					else {
+						Napi::Object nested = Napi::Object::New(env);
+						object.Set(table, nested);
+						nested.Set(key, value);
+					}
+				} else {
+					object.Set(key, value);
+				}
+			}
+			return object;
+		}
+
+		StatementAsyncIterator* iter;
+		int status;
+		int code;
+		bool has_row;
+		bool done;
+		bool safe_ints;
+		char mode;
+		int column_count;
+		ResultRow row;
+		std::vector<ResultColumn> columns;
+		std::string message;
+	};
+
+	NODE_METHOD(JS_new) {
+		UseAddon;
+		if (!addon->privileged_info) return ThrowTypeError(info.Env(), "Disabled constructor");
+		assert(info.IsConstructCall());
+
+		{
+			const Napi::CallbackInfo& pinfo = *addon->privileged_info;
+			Statement* stmt = ::Unwrap<Statement>(pinfo.This());
+			if (!stmt->ReturnsData()) return ThrowTypeError(pinfo.Env(), "This statement does not return data. Use run() instead");
+			sqlite3_stmt* handle = stmt->GetHandle();
+			Database* db = stmt->GetDatabase();
+			REQUIRE_DATABASE_OPEN(db->GetState());
+			REQUIRE_DATABASE_NOT_BUSY(db->GetState());
+			if (stmt->IsLocked()) return ThrowTypeError(pinfo.Env(), "This statement is busy executing a query");
+			if (db->GetState()->iterators == USHRT_MAX) return ThrowRangeError(pinfo.Env(), "Too many active database iterators");
+			if (db->GetState()->has_logger) return ThrowTypeError(pinfo.Env(), "iterateAsync() cannot be used while verbose logging is enabled");
+			const bool bound = stmt->IsBound();
+			if (!bound) {
+				Binder binder(handle);
+				if (!binder.Bind(pinfo, pinfo.Length(), stmt)) {
+					sqlite3_clear_bindings(handle);
+					return pinfo.Env().Undefined();
+				}
+			} else if (pinfo.Length() > 0) {
+				return ThrowTypeError(pinfo.Env(), "This statement already has bound parameters");
+			}
+			this->stmt = stmt;
+			this->handle = handle;
+			this->db = db;
+			this->db_state = db->GetState();
+			this->bound = bound;
+			this->safe_ints = stmt->IsSafeIntegers();
+			this->mode = stmt->GetMode();
+			this->alive = true;
+			assert(stmt != NULL);
+			assert(handle != NULL);
+			assert(stmt->IsBound() == bound);
+			assert(stmt->IsLocked() == false);
+			assert(db_state->iterators < USHRT_MAX);
+			stmt->SetLocked(true);
+			db_state->iterators += 1;
+		}
+
+		UseIsolate;
+		SetFrozen(env, info.This().As<Napi::Object>(), addon->cs.statement, addon->privileged_info->This());
+		return info.This();
+	}
+
+	static NODE_METHOD(JS_next) {
+		StatementAsyncIterator* iter = ::Unwrap<StatementAsyncIterator>(info.This());
+		Napi::Env env = info.Env();
+		if (!iter->alive) {
+			Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+			deferred.Resolve(iter->DoneRecord(env));
+			return deferred.Promise();
+		}
+		if (iter->pending) return ThrowTypeError(env, "This async iterator already has a pending next() call");
+		if (iter->db_state->busy) return ThrowTypeError(env, "This database connection is busy executing a query");
+		iter->pending = true;
+		NextWorker* worker = new NextWorker(env, iter->db, info.This().As<Napi::Object>(), iter);
+		Napi::Promise promise = worker->Promise();
+		iter->db->EnqueueAsync(worker);
+		return promise;
+	}
+
+	static NODE_METHOD(JS_return) {
+		StatementAsyncIterator* iter = ::Unwrap<StatementAsyncIterator>(info.This());
+		Napi::Env env = info.Env();
+		if (iter->pending) return ThrowTypeError(env, "This async iterator already has a pending next() call");
+		if (iter->alive) iter->Cleanup();
+		Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+		deferred.Resolve(iter->DoneRecord(env));
+		return deferred.Promise();
+	}
+
+	static NODE_METHOD(JS_symbolAsyncIterator) {
+		return info.This();
+	}
+
+	Statement* stmt;
+	sqlite3_stmt* handle;
+	Database* db;
+	Database::State* db_state;
+	bool bound;
+	bool safe_ints;
+	char mode;
+	bool alive;
+	bool pending;
+};
+
+const napi_type_tag StatementAsyncIterator::TYPE_TAG = RandomTypeTag();
+}
+
 INIT(Statement::Init) {
 	return DefineClass(env, "Statement", {
 		PrototypeMethod<Statement, &Statement::JS_run>("run", addon),
 		PrototypeMethod<Statement, &Statement::JS_runAsync>("runAsync", addon),
 		PrototypeMethod<Statement, &Statement::JS_get>("get", addon),
+		PrototypeMethod<Statement, &Statement::JS_getAsync>("getAsync", addon),
 		PrototypeMethod<Statement, &Statement::JS_all>("all", addon),
+		PrototypeMethod<Statement, &Statement::JS_allAsync>("allAsync", addon),
 		PrototypeMethod<Statement, &Statement::JS_iterate>("iterate", addon),
+		PrototypeMethod<Statement, &Statement::JS_iterateAsync>("iterateAsync", addon),
 		PrototypeMethod<Statement, &Statement::JS_bind>("bind", addon),
 		PrototypeMethod<Statement, &Statement::JS_pluck>("pluck", addon),
 		PrototypeMethod<Statement, &Statement::JS_expand>("expand", addon),
@@ -436,6 +877,31 @@ NODE_METHOD(Statement::JS_get) {
 	STATEMENT_THROW();
 }
 
+
+NODE_METHOD(Statement::JS_getAsync) {
+	Statement* stmt = ::Unwrap<Statement>(info.This());
+	REQUIRE_STATEMENT_RETURNS_DATA();
+	sqlite3_stmt* handle = stmt->handle;
+	Database* db = stmt->db;
+	REQUIRE_DATABASE_OPEN(db->GetState());
+	if (db->GetState()->busy) return ThrowTypeError(info.Env(), "This database connection is busy executing a query");
+	REQUIRE_STATEMENT_NOT_LOCKED(stmt);
+	if (db->GetState()->has_logger) return ThrowTypeError(info.Env(), "getAsync() cannot be used while verbose logging is enabled");
+	const bool bound = stmt->bound;
+	std::vector<AsyncBindValue> values;
+	if (!bound) {
+		AsyncBinder binder(info.Env(), handle, stmt);
+		if (!binder.Capture(info, values)) return info.Env().Undefined();
+	} else if (info.Length() > 0) {
+		return ThrowTypeError(info.Env(), "This statement already has bound parameters");
+	}
+
+	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, true);
+	Napi::Promise promise = worker->Promise();
+	db->EnqueueAsync(worker);
+	return promise;
+}
+
 NODE_METHOD(Statement::JS_all) {
 	STATEMENT_START(REQUIRE_STATEMENT_RETURNS_DATA, DOES_NOT_MUTATE);
 	const bool safe_ints = stmt->safe_ints;
@@ -479,10 +945,46 @@ NODE_METHOD(Statement::JS_all) {
 	STATEMENT_THROW();
 }
 
+
+NODE_METHOD(Statement::JS_allAsync) {
+	Statement* stmt = ::Unwrap<Statement>(info.This());
+	REQUIRE_STATEMENT_RETURNS_DATA();
+	sqlite3_stmt* handle = stmt->handle;
+	Database* db = stmt->db;
+	REQUIRE_DATABASE_OPEN(db->GetState());
+	if (db->GetState()->busy) return ThrowTypeError(info.Env(), "This database connection is busy executing a query");
+	REQUIRE_STATEMENT_NOT_LOCKED(stmt);
+	if (db->GetState()->has_logger) return ThrowTypeError(info.Env(), "allAsync() cannot be used while verbose logging is enabled");
+	const bool bound = stmt->bound;
+	std::vector<AsyncBindValue> values;
+	if (!bound) {
+		AsyncBinder binder(info.Env(), handle, stmt);
+		if (!binder.Capture(info, values)) return info.Env().Undefined();
+	} else if (info.Length() > 0) {
+		return ThrowTypeError(info.Env(), "This statement already has bound parameters");
+	}
+
+	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, false);
+	Napi::Promise promise = worker->Promise();
+	db->EnqueueAsync(worker);
+	return promise;
+}
+
 NODE_METHOD(Statement::JS_iterate) {
 	UseAddon;
 	UseIsolate;
 	Napi::Function c = addon->StatementIterator.Value();
+	addon->privileged_info = &info;
+	Napi::Object iterator = SafeConstruct(env, c);
+	addon->privileged_info = NULL;
+	if (env.IsExceptionPending()) return env.Undefined();
+	return iterator;
+}
+
+NODE_METHOD(Statement::JS_iterateAsync) {
+	UseAddon;
+	UseIsolate;
+	Napi::Function c = addon->StatementAsyncIterator.Value();
 	addon->privileged_info = &info;
 	Napi::Object iterator = SafeConstruct(env, c);
 	addon->privileged_info = NULL;

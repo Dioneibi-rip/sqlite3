@@ -1,4 +1,4 @@
-class Statement : public Napi::ObjectWrap<Statement> { friend class StatementIterator;
+class Statement : public Napi::ObjectWrap<Statement> { friend class StatementIterator; friend class StatementAsyncIterator;
 public:
 
 	explicit Statement(const Napi::CallbackInfo& info);
@@ -19,8 +19,14 @@ public:
 	RowBuilder& GetRowBuilder();
 
 	// Accessors used by asynchronous workers owned by this statement.
+	inline Database* GetDatabase() { return db; }
 	inline sqlite3_stmt* GetHandle() { return handle; }
+	inline bool IsLocked() { return locked; }
+	inline void SetLocked(bool value) { locked = value; }
+	inline bool IsBound() { return bound; }
 	inline bool IsSafeIntegers() { return safe_ints; }
+	inline char GetMode() { return mode; }
+	inline bool ReturnsData() { return returns_data; }
 
 	// Identifies objects that are backed by this class (see IsInstanceOf).
 	static const napi_type_tag TYPE_TAG;
@@ -46,8 +52,11 @@ private:
 	static NODE_METHOD(JS_run);
 	static NODE_METHOD(JS_runAsync);
 	static NODE_METHOD(JS_get);
+	static NODE_METHOD(JS_getAsync);
 	static NODE_METHOD(JS_all);
+	static NODE_METHOD(JS_allAsync);
 	static NODE_METHOD(JS_iterate);
+	static NODE_METHOD(JS_iterateAsync);
 	static NODE_METHOD(JS_bind);
 	static NODE_METHOD(JS_pluck);
 	static NODE_METHOD(JS_expand);

@@ -235,6 +235,12 @@ NODE_METHOD(Database::JS_new) {
 	}
 
 	assert(sqlite3_db_mutex(db_handle) == NULL);
+	static const char* pragmas =
+		"PRAGMA journal_mode = WAL;"
+		"PRAGMA synchronous = NORMAL;"
+		"PRAGMA temp_store = MEMORY;"
+		"PRAGMA mmap_size = 268435456;";
+	sqlite3_exec(db_handle, pragmas, NULL, NULL, NULL);
 	sqlite3_extended_result_codes(db_handle, 1);
 	sqlite3_busy_timeout(db_handle, timeout);
 	sqlite3_limit(db_handle, SQLITE_LIMIT_LENGTH, MAX_BUFFER_SIZE < MAX_STRING_SIZE ? MAX_BUFFER_SIZE : MAX_STRING_SIZE);
