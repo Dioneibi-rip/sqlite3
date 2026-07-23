@@ -40,6 +40,7 @@
 				(int64_t)sqlite3_##from##_int64(__VA_ARGS__)                   \
 			);                                                                 \
 		}                                                                      \
+		[[fallthrough]];                                                    \
 	case SQLITE_FLOAT:                                                         \
 		return Napi::Number::New(                                              \
 			env,                                                               \

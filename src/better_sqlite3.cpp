@@ -60,12 +60,14 @@ Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
 	exports.Set("Database", Database::Init(env, addon));
 	exports.Set("Statement", Statement::Init(env, addon));
 	exports.Set("StatementIterator", StatementIterator::Init(env, addon));
+	exports.Set("StatementAsyncIterator", StatementAsyncIterator::Init(env, addon));
 	exports.Set("Backup", Backup::Init(env, addon));
 	exports.Set("initialize", Napi::Function::New(env, Addon::JS_initialize, "initialize", addon));
 
 	// Store addon instance data.
 	addon->Statement = Napi::Persistent(exports.Get("Statement").As<Napi::Function>());
 	addon->StatementIterator = Napi::Persistent(exports.Get("StatementIterator").As<Napi::Function>());
+	addon->StatementAsyncIterator = Napi::Persistent(exports.Get("StatementAsyncIterator").As<Napi::Function>());
 	addon->Backup = Napi::Persistent(exports.Get("Backup").As<Napi::Function>());
 
 	return exports;
