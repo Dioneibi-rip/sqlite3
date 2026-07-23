@@ -35,7 +35,7 @@
 	if (!db->open)                                                             \
 		return ThrowTypeError(info.Env(), "The database connection is not open")
 #define REQUIRE_DATABASE_NOT_BUSY(db)                                          \
-	if (db->busy)                                                              \
+	if (db->busy || db->async_busy)                                           \
 		return ThrowTypeError(info.Env(), "This database connection is busy executing a query")
 #define REQUIRE_DATABASE_NO_ITERATORS(db)                                      \
 	if (db->iterators)                                                         \

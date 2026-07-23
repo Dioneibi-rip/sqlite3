@@ -18,6 +18,10 @@ public:
 	// Returns the Statement's row builder.
 	RowBuilder& GetRowBuilder();
 
+	// Accessors used by asynchronous workers owned by this statement.
+	inline sqlite3_stmt* GetHandle() { return handle; }
+	inline bool IsSafeIntegers() { return safe_ints; }
+
 	// Identifies objects that are backed by this class (see IsInstanceOf).
 	static const napi_type_tag TYPE_TAG;
 
@@ -40,6 +44,7 @@ private:
 
 	NODE_METHOD(JS_new);
 	static NODE_METHOD(JS_run);
+	static NODE_METHOD(JS_runAsync);
 	static NODE_METHOD(JS_get);
 	static NODE_METHOD(JS_all);
 	static NODE_METHOD(JS_iterate);

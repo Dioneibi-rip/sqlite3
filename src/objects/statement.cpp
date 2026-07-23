@@ -59,9 +59,235 @@ Statement::Extras::Extras(
 	row_builder(env, row_factory, array_factory),
 	id(id) {}
 
+
+namespace {
+	struct AsyncBindValue {
+		enum Type { Null, Double, Int64, Text, Blob } type;
+		int index;
+		double number;
+		int64_t integer;
+		std::string bytes;
+	};
+
+	class AsyncBinder {
+	public:
+		AsyncBinder(Napi::Env env, sqlite3_stmt* handle, Statement* stmt) :
+			env(env), handle(handle), stmt(stmt), param_count(sqlite3_bind_parameter_count(handle)), anon_index(0), success(true), count(0), bound_object(false) {}
+
+		bool Capture(const Napi::CallbackInfo& info, std::vector<AsyncBindValue>& out) {
+			for (size_t i = 0; i < info.Length(); ++i) {
+				Napi::Value arg = info[i];
+				if (arg.IsArray()) {
+					CaptureArray(arg.As<Napi::Array>(), out);
+					if (!success) break;
+					continue;
+				}
+				if (arg.IsObject() && !arg.IsBuffer()) {
+					Napi::Object obj = arg.As<Napi::Object>();
+					if (IsPlainObject(obj)) {
+						if (bound_object) {
+							Fail(ThrowTypeError, "You cannot specify named parameters in two different objects");
+							break;
+						}
+						bound_object = true;
+						CaptureObject(obj, out);
+						if (!success) break;
+						continue;
+					} else if (env.IsExceptionPending()) {
+						success = false;
+						break;
+					} else if (stmt->GetBindMap(env).GetSize()) {
+						Fail(ThrowTypeError, "Named parameters can only be passed within plain objects");
+						break;
+					}
+				}
+				CaptureValue(arg, NextAnonIndex(), out);
+				if (!success) break;
+				count += 1;
+			}
+			if (success && count != param_count) {
+				if (count < param_count) {
+					if (!bound_object && stmt->GetBindMap(env).GetSize()) Fail(ThrowTypeError, "Missing named parameters");
+					else Fail(ThrowRangeError, "Too few parameter values were provided");
+				} else {
+					Fail(ThrowRangeError, "Too many parameter values were provided");
+				}
+			}
+			return success;
+		}
+
+	private:
+		static Napi::Value GetPrototype(Napi::Env env, Napi::Object obj) {
+			napi_value proto;
+			if (napi_get_prototype(env, obj, &proto) != napi_ok) return Napi::Value();
+			return Napi::Value(env, proto);
+		}
+
+		bool IsPlainObject(Napi::Object obj) {
+			Napi::Value proto = GetPrototype(env, obj);
+			if (proto.IsEmpty()) return false;
+			if (proto.IsNull()) return true;
+			Napi::Value grandproto = GetPrototype(env, proto.As<Napi::Object>());
+			if (grandproto.IsEmpty()) return false;
+			return grandproto.IsNull();
+		}
+
+		void Fail(Napi::Value (*Throw)(Napi::Env, const char*), const char* message) {
+			if (success && Throw) Throw(env, message);
+			success = false;
+		}
+
+		int NextAnonIndex() {
+			while (sqlite3_bind_parameter_name(handle, ++anon_index) != NULL) {}
+			return anon_index;
+		}
+
+		void CaptureValue(Napi::Value value, int index, std::vector<AsyncBindValue>& out) {
+			AsyncBindValue item;
+			item.index = index;
+			item.number = 0;
+			item.integer = 0;
+			if (value.IsNumber()) {
+				item.type = AsyncBindValue::Double;
+				item.number = value.As<Napi::Number>().DoubleValue();
+			} else if (value.IsBigInt()) {
+				bool lossless;
+				item.integer = value.As<Napi::BigInt>().Int64Value(&lossless);
+				if (!lossless) return Fail(ThrowRangeError, "The bound string, buffer, or bigint is too big");
+				item.type = AsyncBindValue::Int64;
+			} else if (value.IsString()) {
+				item.type = AsyncBindValue::Text;
+				item.bytes = value.As<Napi::String>().Utf8Value();
+			} else if (value.IsBuffer()) {
+				item.type = AsyncBindValue::Blob;
+				Napi::Buffer<char> buffer = value.As<Napi::Buffer<char>>();
+				item.bytes.assign(buffer.Data(), buffer.Data() + buffer.Length());
+			} else if (value.IsNull() || value.IsUndefined()) {
+				item.type = AsyncBindValue::Null;
+			} else {
+				return Fail(ThrowTypeError, "SQLite3 can only bind numbers, strings, bigints, buffers, and null");
+			}
+			out.emplace_back(std::move(item));
+		}
+
+		void CaptureArray(Napi::Array arr, std::vector<AsyncBindValue>& out) {
+			uint32_t length = arr.Length();
+			if (length > INT_MAX) return Fail(ThrowRangeError, "Too many parameter values were provided");
+			int len = static_cast<int>(length);
+			for (int i = 0; i < len; ++i) {
+				Napi::Value value = SafeGetElement(env, arr, static_cast<uint32_t>(i));
+				if (value.IsEmpty()) { success = false; return; }
+				CaptureValue(value, NextAnonIndex(), out);
+				if (!success) return;
+			}
+			count += len;
+		}
+
+		void CaptureObject(Napi::Object obj, std::vector<AsyncBindValue>& out) {
+			BindMap& bind_map = stmt->GetBindMap(env);
+			BindMap::Pair* pairs = bind_map.GetPairs();
+			int len = bind_map.GetSize();
+			for (int i = 0; i < len; ++i) {
+				Napi::String key = pairs[i].GetName(env);
+				bool has_property;
+				if (!SafeHasOwnProperty(env, obj, key, &has_property)) { success = false; return; }
+				if (!has_property) {
+					std::string param_name = key.Utf8Value();
+					Fail(ThrowRangeError, (std::string("Missing named parameter \"") + param_name + "\"").c_str());
+					return;
+				}
+				Napi::Value value = SafeGet(env, obj, key);
+				if (value.IsEmpty()) { success = false; return; }
+				CaptureValue(value, pairs[i].GetIndex(), out);
+				if (!success) return;
+			}
+			count += len;
+		}
+
+		Napi::Env env;
+		sqlite3_stmt* handle;
+		Statement* stmt;
+		int param_count;
+		int anon_index;
+		bool success;
+		int count;
+		bool bound_object;
+	};
+
+	class RunAsyncWorker : public QueuedAsyncWorker {
+	public:
+		RunAsyncWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound)
+			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), changes(0), id(0), safe_ints(stmt->IsSafeIntegers()), status(SQLITE_OK), code(SQLITE_OK) {}
+
+		void Execute() override {
+			sqlite3_stmt* handle = stmt->GetHandle();
+			sqlite3* db_handle = db->GetHandle();
+			int total_changes_before = sqlite3_total_changes(db_handle);
+			if (!bound) {
+				for (const AsyncBindValue& value : values) {
+					status = Bind(handle, value);
+					if (status != SQLITE_OK) break;
+				}
+			}
+			if (status == SQLITE_OK) {
+				sqlite3_step(handle);
+				status = sqlite3_reset(handle);
+			}
+			if (status == SQLITE_OK) {
+				changes = sqlite3_total_changes(db_handle) == total_changes_before ? 0 : sqlite3_changes(db_handle);
+				id = sqlite3_last_insert_rowid(db_handle);
+			} else {
+				code = sqlite3_extended_errcode(db_handle);
+				message = sqlite3_errmsg(db_handle);
+				SetError(message);
+			}
+			if (!bound) sqlite3_clear_bindings(handle);
+		}
+
+		void OnOK() override {
+			Napi::Object result = Napi::Object::New(Env());
+			result.Set(db->GetAddon()->cs.changes.Value(), Napi::Number::New(Env(), changes));
+			if (safe_ints) result.Set(db->GetAddon()->cs.lastInsertRowid.Value(), Napi::BigInt::New(Env(), (int64_t)id));
+			else result.Set(db->GetAddon()->cs.lastInsertRowid.Value(), Napi::Number::New(Env(), (double)id));
+			deferred.Resolve(result);
+			FinishQueue();
+		}
+
+		void OnError(const Napi::Error& error) override {
+			Napi::Object err = error.Value();
+			err.Set("code", db->GetAddon()->cs.Code(Env(), code));
+			deferred.Reject(err);
+			FinishQueue();
+		}
+
+	private:
+		int Bind(sqlite3_stmt* handle, const AsyncBindValue& value) {
+			switch (value.type) {
+				case AsyncBindValue::Null: return sqlite3_bind_null(handle, value.index);
+				case AsyncBindValue::Double: return sqlite3_bind_double(handle, value.index, value.number);
+				case AsyncBindValue::Int64: return sqlite3_bind_int64(handle, value.index, value.integer);
+				case AsyncBindValue::Text: return sqlite3_bind_text(handle, value.index, value.bytes.c_str(), value.bytes.length(), SQLITE_TRANSIENT);
+				case AsyncBindValue::Blob: return sqlite3_bind_blob(handle, value.index, value.bytes.data(), value.bytes.length(), SQLITE_TRANSIENT);
+			}
+			return SQLITE_MISUSE;
+		}
+
+		Statement* stmt;
+		std::vector<AsyncBindValue> values;
+		bool bound;
+		int changes;
+		sqlite3_int64 id;
+		bool safe_ints;
+		int status;
+		int code;
+		std::string message;
+	};
+}
+
 INIT(Statement::Init) {
 	return DefineClass(env, "Statement", {
 		PrototypeMethod<Statement, &Statement::JS_run>("run", addon),
+		PrototypeMethod<Statement, &Statement::JS_runAsync>("runAsync", addon),
 		PrototypeMethod<Statement, &Statement::JS_get>("get", addon),
 		PrototypeMethod<Statement, &Statement::JS_all>("all", addon),
 		PrototypeMethod<Statement, &Statement::JS_iterate>("iterate", addon),
@@ -262,6 +488,32 @@ NODE_METHOD(Statement::JS_iterate) {
 	addon->privileged_info = NULL;
 	if (env.IsExceptionPending()) return env.Undefined();
 	return iterator;
+}
+
+
+NODE_METHOD(Statement::JS_runAsync) {
+	Statement* stmt = ::Unwrap<Statement>(info.This());
+	ALLOW_ANY_STATEMENT();
+	sqlite3_stmt* handle = stmt->handle;
+	Database* db = stmt->db;
+	REQUIRE_DATABASE_OPEN(db->GetState());
+	if (db->GetState()->busy) return ThrowTypeError(info.Env(), "This database connection is busy executing a query");
+	REQUIRE_STATEMENT_NOT_LOCKED(stmt);
+	REQUIRE_DATABASE_NO_ITERATORS_UNLESS_UNSAFE(db->GetState());
+	if (db->GetState()->has_logger) return ThrowTypeError(info.Env(), "runAsync() cannot be used while verbose logging is enabled");
+	const bool bound = stmt->bound;
+	std::vector<AsyncBindValue> values;
+	if (!bound) {
+		AsyncBinder binder(info.Env(), handle, stmt);
+		if (!binder.Capture(info, values)) return info.Env().Undefined();
+	} else if (info.Length() > 0) {
+		return ThrowTypeError(info.Env(), "This statement already has bound parameters");
+	}
+
+	RunAsyncWorker* worker = new RunAsyncWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound);
+	Napi::Promise promise = worker->Promise();
+	db->EnqueueAsync(worker);
+	return promise;
 }
 
 NODE_METHOD(Statement::JS_bind) {
