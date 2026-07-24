@@ -62,11 +62,12 @@ void StatementIterator::Cleanup() {
 }
 
 INIT(StatementIterator::Init) {
-	return DefineClass(env, "StatementIterator", {
+	Napi::Function ctor = DefineClass(env, "StatementIterator", {}, addon);
+	DefinePrototypeMethods(env, ctor, {
 		PrototypeMethod<StatementIterator, &StatementIterator::JS_next>("next", addon),
 		PrototypeMethod<StatementIterator, &StatementIterator::JS_return>("return", addon),
-		PrototypeSymbolMethod<StatementIterator, &StatementIterator::JS_symbolIterator>(Napi::Symbol::WellKnown(env, "iterator"), addon),
-	}, addon);
+	});
+	return ctor;
 }
 
 NODE_METHOD(StatementIterator::JS_new) {

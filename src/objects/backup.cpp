@@ -31,10 +31,12 @@ void Backup::CloseHandles() {
 }
 
 INIT(Backup::Init) {
-	return DefineClass(env, "Backup", {
+	Napi::Function ctor = DefineClass(env, "Backup", {}, addon);
+	DefinePrototypeMethods(env, ctor, {
 		PrototypeMethod<Backup, &Backup::JS_transfer>("transfer", addon),
 		PrototypeMethod<Backup, &Backup::JS_close>("close", addon),
-	}, addon);
+	});
+	return ctor;
 }
 
 NODE_METHOD(Backup::JS_new) {
@@ -103,8 +105,8 @@ NODE_METHOD(Backup::JS_transfer) {
 		int total_pages = sqlite3_backup_pagecount(backup_handle);
 		int remaining_pages = sqlite3_backup_remaining(backup_handle);
 		Napi::Object result = Napi::Object::New(env);
-		result.Set(addon->cs.totalPages.Value(), Napi::Number::New(env, total_pages));
-		result.Set(addon->cs.remainingPages.Value(), Napi::Number::New(env, remaining_pages));
+		result.Set(addon->cs.totalPages.Value(env), Napi::Number::New(env, total_pages));
+		result.Set(addon->cs.remainingPages.Value(env), Napi::Number::New(env, remaining_pages));
 		if (status == SQLITE_DONE) backup->unlink = false;
 		return result;
 	} else {

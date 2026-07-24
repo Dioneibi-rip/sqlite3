@@ -192,7 +192,8 @@ private:
 };
 
 INIT(Database::Init) {
-	return DefineClass(env, "Database", {
+	Napi::Function ctor = DefineClass(env, "Database", {}, addon);
+	DefinePrototypeMethods(env, ctor, {
 		PrototypeMethod<Database, &Database::JS_prepare>("prepare", addon),
 		PrototypeMethod<Database, &Database::JS_exec>("exec", addon),
 		PrototypeMethod<Database, &Database::JS_execAsync>("execAsync", addon),
@@ -205,7 +206,8 @@ INIT(Database::Init) {
 		PrototypeMethod<Database, &Database::JS_close>("close", addon),
 		PrototypeMethod<Database, &Database::JS_defaultSafeIntegers>("defaultSafeIntegers", addon),
 		PrototypeMethod<Database, &Database::JS_unsafeMode>("unsafeMode", addon),
-	}, addon);
+	});
+	return ctor;
 }
 
 NODE_METHOD(Database::JS_new) {
