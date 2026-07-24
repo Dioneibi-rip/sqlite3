@@ -1,11 +1,11 @@
-// Caches JavaScript strings that are used frequently as property keys or
-// error codes. Persistent references to strings require Node-API version 10.
+// Caches property-key text without creating persistent references to primitive
+// strings, which are not portable when compiling against Node-API version 8.
 class CS {
 public:
 
 	Napi::String Code(Napi::Env env, int code) {
 		auto element = codes.find(code);
-		if (element != codes.end()) return element->second.Value();
+		if (element != codes.end()) return StringFromUtf8(env, element->second.c_str(), -1);
 		return StringFromUtf8(env, (std::string("UNKNOWN_SQLITE_ERROR_") + std::to_string(code)).c_str(), -1);
 	}
 
@@ -139,34 +139,40 @@ public:
 		SetCode(env, SQLITE_OK_SYMLINK, "SQLITE_OK_SYMLINK");
 	}
 
-	Napi::Reference<Napi::String> database;
-	Napi::Reference<Napi::String> reader;
-	Napi::Reference<Napi::String> source;
-	Napi::Reference<Napi::String> memory;
-	Napi::Reference<Napi::String> readonly;
-	Napi::Reference<Napi::String> name;
-	Napi::Reference<Napi::String> next;
-	Napi::Reference<Napi::String> length;
-	Napi::Reference<Napi::String> done;
-	Napi::Reference<Napi::String> value;
-	Napi::Reference<Napi::String> changes;
-	Napi::Reference<Napi::String> lastInsertRowid;
-	Napi::Reference<Napi::String> statement;
-	Napi::Reference<Napi::String> column;
-	Napi::Reference<Napi::String> table;
-	Napi::Reference<Napi::String> type;
-	Napi::Reference<Napi::String> totalPages;
-	Napi::Reference<Napi::String> remainingPages;
+	struct Key {
+		const char* str = NULL;
+		Napi::String Value(Napi::Env env) const { return InternalizedFromLatin1(env, str); }
+	};
+	Key database;
+	Key reader;
+	Key source;
+	Key memory;
+	Key readonly;
+	Key name;
+	Key next;
+	Key length;
+	Key done;
+	Key value;
+	Key changes;
+	Key lastInsertRowid;
+	Key statement;
+	Key column;
+	Key table;
+	Key type;
+	Key totalPages;
+	Key remainingPages;
 
 private:
 
-	static void SetString(Napi::Env env, Napi::Reference<Napi::String>& constant, const char* str) {
-		constant = Napi::Persistent(InternalizedFromLatin1(env, str));
+	static void SetString(Napi::Env env, Key& constant, const char* str) {
+		(void)env;
+		constant.str = str;
 	}
 
 	void SetCode(Napi::Env env, int code, const char* str) {
-		codes.emplace(code, Napi::Persistent(InternalizedFromLatin1(env, str)));
+		(void)env;
+		codes.emplace(code, str);
 	}
 
-	std::unordered_map<int, Napi::Reference<Napi::String>> codes;
+	std::unordered_map<int, std::string> codes;
 };

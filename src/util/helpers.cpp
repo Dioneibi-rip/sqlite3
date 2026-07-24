@@ -31,8 +31,9 @@ inline bool IsInt32(Napi::Value value) {
 	return static_cast<double>(static_cast<int32_t>(num)) == num;
 }
 
-inline void SetFrozen(Napi::Env env, Napi::Object obj, const Napi::Reference<Napi::String>& key, Napi::Value value) {
-	obj.DefineProperty(Napi::PropertyDescriptor::Value(key.Value(), value, napi_enumerable));
+template <typename Key>
+inline void SetFrozen(Napi::Env env, Napi::Object obj, const Key& key, Napi::Value value) {
+	obj.DefineProperty(Napi::PropertyDescriptor::Value(key.Value(env), value, napi_enumerable));
 }
 
 // The following helpers perform JavaScript operations that can execute
@@ -146,14 +147,12 @@ napi_property_descriptor PrototypeMethod(const char* name, Addon* addon) {
 	return desc;
 }
 
-template <typename T, Napi::Value (*method)(const Napi::CallbackInfo&)>
-napi_property_descriptor PrototypeSymbolMethod(Napi::Symbol symbol, Addon* addon) {
-	napi_property_descriptor desc = {};
-	desc.name = symbol;
-	desc.method = TypeSafeCallback<T, method>;
-	desc.attributes = DEFAULT_ATTRIBUTES;
-	desc.data = addon;
-	return desc;
+inline void DefinePrototypeMethods(Napi::Env env, Napi::Function ctor, std::initializer_list<napi_property_descriptor> descriptors) {
+	napi_value prototype;
+	napi_status status = napi_get_named_property(env, ctor, "prototype", &prototype);
+	assert(status == napi_ok);
+	status = napi_define_properties(env, prototype, descriptors.size(), descriptors.begin());
+	assert(status == napi_ok); ((void)status);
 }
 
 // Defines a getter as an own property of the given object. V8 exposed these

@@ -432,9 +432,9 @@ namespace {
 
 		void OnOK() override {
 			Napi::Object result = Napi::Object::New(Env());
-			result.Set(db->GetAddon()->cs.changes.Value(), Napi::Number::New(Env(), changes));
-			if (safe_ints) result.Set(db->GetAddon()->cs.lastInsertRowid.Value(), Napi::BigInt::New(Env(), (int64_t)id));
-			else result.Set(db->GetAddon()->cs.lastInsertRowid.Value(), Napi::Number::New(Env(), (double)id));
+			result.Set(db->GetAddon()->cs.changes.Value(Env()), Napi::Number::New(Env(), changes));
+			if (safe_ints) result.Set(db->GetAddon()->cs.lastInsertRowid.Value(Env()), Napi::BigInt::New(Env(), (int64_t)id));
+			else result.Set(db->GetAddon()->cs.lastInsertRowid.Value(Env()), Napi::Number::New(Env(), (double)id));
 			deferred.Resolve(result);
 			FinishQueue();
 		}
@@ -494,11 +494,12 @@ public:
 
 	static const napi_type_tag TYPE_TAG;
 	static INIT(Init) {
-		return DefineClass(env, "StatementAsyncIterator", {
+		Napi::Function ctor = DefineClass(env, "StatementAsyncIterator", {}, addon);
+		DefinePrototypeMethods(env, ctor, {
 			PrototypeMethod<StatementAsyncIterator, &StatementAsyncIterator::JS_next>("next", addon),
 			PrototypeMethod<StatementAsyncIterator, &StatementAsyncIterator::JS_return>("return", addon),
-			PrototypeSymbolMethod<StatementAsyncIterator, &StatementAsyncIterator::JS_symbolAsyncIterator>(Napi::Symbol::WellKnown(env, "asyncIterator"), addon),
-		}, addon);
+		});
+		return ctor;
 	}
 
 	Napi::Object DoneRecord(Napi::Env env) {
@@ -508,10 +509,10 @@ public:
 	Napi::Object NewRecord(Napi::Env env, Napi::Value value, bool done) {
 		Addon* addon = db_state->addon;
 		napi_property_descriptor properties[2] = {};
-		properties[0].name = addon->cs.value.Value();
+		properties[0].name = addon->cs.value.Value(env);
 		properties[0].value = value;
 		properties[0].attributes = DEFAULT_ATTRIBUTES;
-		properties[1].name = addon->cs.done.Value();
+		properties[1].name = addon->cs.done.Value(env);
 		properties[1].value = Napi::Boolean::New(env, done);
 		properties[1].attributes = DEFAULT_ATTRIBUTES;
 		napi_value record;
@@ -723,7 +724,8 @@ const napi_type_tag StatementAsyncIterator::TYPE_TAG = RandomTypeTag();
 }
 
 INIT(Statement::Init) {
-	return DefineClass(env, "Statement", {
+	Napi::Function ctor = DefineClass(env, "Statement", {}, addon);
+	DefinePrototypeMethods(env, ctor, {
 		PrototypeMethod<Statement, &Statement::JS_run>("run", addon),
 		PrototypeMethod<Statement, &Statement::JS_runAsync>("runAsync", addon),
 		PrototypeMethod<Statement, &Statement::JS_get>("get", addon),
@@ -739,7 +741,8 @@ INIT(Statement::Init) {
 		PrototypeMethod<Statement, &Statement::JS_safeIntegers>("safeIntegers", addon),
 		PrototypeMethod<Statement, &Statement::JS_columns>("columns", addon),
 		PrototypeMethod<Statement, &Statement::JS_toString>("toString", addon),
-	}, addon);
+	});
+	return ctor;
 }
 
 NODE_METHOD(Statement::JS_new) {
@@ -841,10 +844,10 @@ NODE_METHOD(Statement::JS_run) {
 		Addon* addon = db->GetAddon();
 
 		napi_property_descriptor properties[2] = {};
-		properties[0].name = addon->cs.changes.Value();
+		properties[0].name = addon->cs.changes.Value(env);
 		properties[0].value = Napi::Number::New(env, changes);
 		properties[0].attributes = DEFAULT_ATTRIBUTES;
-		properties[1].name = addon->cs.lastInsertRowid.Value();
+		properties[1].name = addon->cs.lastInsertRowid.Value(env);
 		if (stmt->safe_ints) {
 			properties[1].value = Napi::BigInt::New(env, (int64_t)id);
 		} else {
@@ -1082,11 +1085,11 @@ NODE_METHOD(Statement::JS_columns) {
 	int column_count = sqlite3_column_count(stmt->handle);
 	Napi::Array columns = Napi::Array::New(env, column_count);
 
-	Napi::String name = addon->cs.name.Value();
-	Napi::String columnName = addon->cs.column.Value();
-	Napi::String tableName = addon->cs.table.Value();
-	Napi::String databaseName = addon->cs.database.Value();
-	Napi::String typeName = addon->cs.type.Value();
+	Napi::String name = addon->cs.name.Value(env);
+	Napi::String columnName = addon->cs.column.Value(env);
+	Napi::String tableName = addon->cs.table.Value(env);
+	Napi::String databaseName = addon->cs.database.Value(env);
+	Napi::String typeName = addon->cs.type.Value(env);
 
 	for (int i = 0; i < column_count; ++i) {
 		Napi::Object column = Napi::Object::New(env);
@@ -1125,7 +1128,7 @@ NODE_METHOD(Statement::JS_toString) {
 	}
 
 	return info.This().As<Napi::Object>()
-		.Get(addon->cs.source.Value())
+		.Get(addon->cs.source.Value(info.Env()))
 		.As<Napi::String>();
 }
 

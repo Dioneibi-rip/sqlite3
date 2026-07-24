@@ -36,10 +36,10 @@ private:
 
 		// Slow path, only used after the iterator is done.
 		napi_property_descriptor properties[2] = {};
-		properties[0].name = addon->cs.value.Value();
+		properties[0].name = addon->cs.value.Value(env);
 		properties[0].value = value;
 		properties[0].attributes = DEFAULT_ATTRIBUTES;
-		properties[1].name = addon->cs.done.Value();
+		properties[1].name = addon->cs.done.Value(env);
 		properties[1].value = Napi::Boolean::New(env, done);
 		properties[1].attributes = DEFAULT_ATTRIBUTES;
 

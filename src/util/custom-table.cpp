@@ -217,7 +217,7 @@ private:
 
 		// Store the iterator and its next() method; we'll be using it a lot.
 		Napi::Object iterator = maybeIterator.As<Napi::Object>();
-		Napi::Function next = iterator.Get(addon->cs.next.Value()).As<Napi::Function>();
+		Napi::Function next = iterator.Get(addon->cs.next.Value(env)).As<Napi::Function>();
 		cursor->iterator.Reset(iterator, 1);
 		cursor->next.Reset(next, 1);
 		cursor->rowid = 0;
@@ -245,9 +245,9 @@ private:
 		}
 
 		Napi::Object record = maybeRecord.As<Napi::Object>();
-		bool done = record.Get(addon->cs.done.Value()).As<Napi::Boolean>().Value();
+		bool done = record.Get(addon->cs.done.Value(env)).As<Napi::Boolean>().Value();
 		if (!done) {
-			cursor->row.Reset(record.Get(addon->cs.value.Value()).As<Napi::Array>(), 1);
+			cursor->row.Reset(record.Get(addon->cs.value.Value(env)).As<Napi::Array>(), 1);
 		}
 		cursor->done = done;
 		cursor->rowid += 1;
