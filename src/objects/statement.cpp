@@ -283,13 +283,24 @@ namespace {
 
 	class AsyncReaderWorker : public QueuedAsyncWorker {
 	public:
-		AsyncReaderWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound, bool single)
-			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), single(single), safe_ints(stmt->IsSafeIntegers()), mode(stmt->GetMode()), column_count(0), status(SQLITE_OK), code(SQLITE_OK) {}
+		AsyncReaderWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound, bool single, bool write)
+			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), single(single), write(write), safe_ints(stmt->IsSafeIntegers()), mode(stmt->GetMode()), column_count(0), status(SQLITE_OK), code(SQLITE_OK) {}
 
 		void Execute() override {
 			sqlite3_stmt* handle = stmt->GetHandle();
 			sqlite3* db_handle = db->GetHandle();
-			if (!bound) {
+			bool transaction_started = false;
+			bool savepoint_started = false;
+			bool autocommit = sqlite3_get_autocommit(db_handle) != 0;
+			if (write && autocommit) {
+				status = ExecSql(db_handle, "BEGIN IMMEDIATE;");
+				transaction_started = status == SQLITE_OK;
+			}
+			if (status == SQLITE_OK && write) {
+				status = ExecSql(db_handle, "SAVEPOINT __ruby_hoshino_job;");
+				savepoint_started = status == SQLITE_OK;
+			}
+			if (status == SQLITE_OK && !bound) {
 				for (const AsyncBindValue& value : values) {
 					status = Bind(handle, value);
 					if (status != SQLITE_OK) break;
@@ -308,6 +319,13 @@ namespace {
 				if (status == SQLITE_ROW || status == SQLITE_DONE) status = sqlite3_reset(handle);
 				else sqlite3_reset(handle);
 			}
+			if (status == SQLITE_OK && write) status = ExecSql(db_handle, "RELEASE SAVEPOINT __ruby_hoshino_job;");
+			else if (write && savepoint_started) {
+				ExecSql(db_handle, "ROLLBACK TO SAVEPOINT __ruby_hoshino_job;");
+				ExecSql(db_handle, "RELEASE SAVEPOINT __ruby_hoshino_job;");
+			}
+			if (status == SQLITE_OK && transaction_started) status = ExecSql(db_handle, "COMMIT;");
+			else if (transaction_started) ExecSql(db_handle, "ROLLBACK;");
 			if (status != SQLITE_OK) {
 				code = sqlite3_extended_errcode(db_handle);
 				message = sqlite3_errmsg(db_handle);
@@ -317,6 +335,7 @@ namespace {
 		}
 
 		void OnOK() override {
+			stmt->SetLocked(false);
 			if (single) {
 				deferred.Resolve(rows.empty() ? Env().Undefined() : RowToJS(rows[0]));
 			} else {
@@ -328,6 +347,7 @@ namespace {
 		}
 
 		void OnError(const Napi::Error& error) override {
+			stmt->SetLocked(false);
 			Napi::Object err = error.Value();
 			err.Set("code", db->GetAddon()->cs.Code(Env(), code));
 			deferred.Reject(err);
@@ -335,6 +355,10 @@ namespace {
 		}
 
 	private:
+		int ExecSql(sqlite3* db_handle, const char* sql) {
+			return sqlite3_exec(db_handle, sql, NULL, NULL, NULL);
+		}
+
 		int Bind(sqlite3_stmt* handle, const AsyncBindValue& value) {
 			switch (value.type) {
 				case AsyncBindValue::Null: return sqlite3_bind_null(handle, value.index);
@@ -390,6 +414,7 @@ namespace {
 		std::vector<AsyncBindValue> values;
 		bool bound;
 		bool single;
+		bool write;
 		bool safe_ints;
 		char mode;
 		int column_count;
@@ -402,14 +427,25 @@ namespace {
 
 	class RunAsyncWorker : public QueuedAsyncWorker {
 	public:
-		RunAsyncWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound)
-			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), changes(0), id(0), safe_ints(stmt->IsSafeIntegers()), status(SQLITE_OK), code(SQLITE_OK) {}
+		RunAsyncWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound, bool write)
+			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), write(write), changes(0), id(0), safe_ints(stmt->IsSafeIntegers()), status(SQLITE_OK), code(SQLITE_OK) {}
 
 		void Execute() override {
 			sqlite3_stmt* handle = stmt->GetHandle();
 			sqlite3* db_handle = db->GetHandle();
 			int total_changes_before = sqlite3_total_changes(db_handle);
-			if (!bound) {
+			bool transaction_started = false;
+			bool savepoint_started = false;
+			bool autocommit = sqlite3_get_autocommit(db_handle) != 0;
+			if (write && autocommit) {
+				status = ExecSql(db_handle, "BEGIN IMMEDIATE;");
+				transaction_started = status == SQLITE_OK;
+			}
+			if (status == SQLITE_OK && write) {
+				status = ExecSql(db_handle, "SAVEPOINT __ruby_hoshino_job;");
+				savepoint_started = status == SQLITE_OK;
+			}
+			if (status == SQLITE_OK && !bound) {
 				for (const AsyncBindValue& value : values) {
 					status = Bind(handle, value);
 					if (status != SQLITE_OK) break;
@@ -418,7 +454,16 @@ namespace {
 			if (status == SQLITE_OK) {
 				sqlite3_step(handle);
 				status = sqlite3_reset(handle);
+			} else {
+				sqlite3_reset(handle);
 			}
+			if (status == SQLITE_OK && write) status = ExecSql(db_handle, "RELEASE SAVEPOINT __ruby_hoshino_job;");
+			else if (write && savepoint_started) {
+				ExecSql(db_handle, "ROLLBACK TO SAVEPOINT __ruby_hoshino_job;");
+				ExecSql(db_handle, "RELEASE SAVEPOINT __ruby_hoshino_job;");
+			}
+			if (status == SQLITE_OK && transaction_started) status = ExecSql(db_handle, "COMMIT;");
+			else if (transaction_started) ExecSql(db_handle, "ROLLBACK;");
 			if (status == SQLITE_OK) {
 				changes = sqlite3_total_changes(db_handle) == total_changes_before ? 0 : sqlite3_changes(db_handle);
 				id = sqlite3_last_insert_rowid(db_handle);
@@ -431,6 +476,7 @@ namespace {
 		}
 
 		void OnOK() override {
+			stmt->SetLocked(false);
 			Napi::Object result = Napi::Object::New(Env());
 			result.Set(db->GetAddon()->cs.changes.Value(Env()), Napi::Number::New(Env(), changes));
 			if (safe_ints) result.Set(db->GetAddon()->cs.lastInsertRowid.Value(Env()), Napi::BigInt::New(Env(), (int64_t)id));
@@ -440,6 +486,7 @@ namespace {
 		}
 
 		void OnError(const Napi::Error& error) override {
+			stmt->SetLocked(false);
 			Napi::Object err = error.Value();
 			err.Set("code", db->GetAddon()->cs.Code(Env(), code));
 			deferred.Reject(err);
@@ -447,6 +494,10 @@ namespace {
 		}
 
 	private:
+		int ExecSql(sqlite3* db_handle, const char* sql) {
+			return sqlite3_exec(db_handle, sql, NULL, NULL, NULL);
+		}
+
 		int Bind(sqlite3_stmt* handle, const AsyncBindValue& value) {
 			switch (value.type) {
 				case AsyncBindValue::Null: return sqlite3_bind_null(handle, value.index);
@@ -461,6 +512,7 @@ namespace {
 		Statement* stmt;
 		std::vector<AsyncBindValue> values;
 		bool bound;
+		bool write;
 		int changes;
 		sqlite3_int64 id;
 		bool safe_ints;
@@ -899,9 +951,12 @@ NODE_METHOD(Statement::JS_getAsync) {
 		return ThrowTypeError(info.Env(), "This statement already has bound parameters");
 	}
 
-	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, true);
+	bool write = sqlite3_stmt_readonly(handle) == 0;
+	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, true, write);
 	Napi::Promise promise = worker->Promise();
-	db->EnqueueAsync(worker);
+	stmt->SetLocked(true);
+	if (write) db->EnqueueWriteAsync(worker);
+	else db->EnqueueAsync(worker);
 	return promise;
 }
 
@@ -967,9 +1022,12 @@ NODE_METHOD(Statement::JS_allAsync) {
 		return ThrowTypeError(info.Env(), "This statement already has bound parameters");
 	}
 
-	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, false);
+	bool write = sqlite3_stmt_readonly(handle) == 0;
+	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, false, write);
 	Napi::Promise promise = worker->Promise();
-	db->EnqueueAsync(worker);
+	stmt->SetLocked(true);
+	if (write) db->EnqueueWriteAsync(worker);
+	else db->EnqueueAsync(worker);
 	return promise;
 }
 
@@ -1015,9 +1073,12 @@ NODE_METHOD(Statement::JS_runAsync) {
 		return ThrowTypeError(info.Env(), "This statement already has bound parameters");
 	}
 
-	RunAsyncWorker* worker = new RunAsyncWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound);
+	bool write = sqlite3_stmt_readonly(handle) == 0;
+	RunAsyncWorker* worker = new RunAsyncWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, write);
 	Napi::Promise promise = worker->Promise();
-	db->EnqueueAsync(worker);
+	stmt->SetLocked(true);
+	if (write) db->EnqueueWriteAsync(worker);
+	else db->EnqueueAsync(worker);
 	return promise;
 }
 

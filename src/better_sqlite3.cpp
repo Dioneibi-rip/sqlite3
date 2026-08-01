@@ -1,9 +1,11 @@
 #include <cassert>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <memory>
 #include <vector>
 #include <set>
 #include <random>
@@ -13,6 +15,7 @@
 #include <deque>
 #include <sqlite3.h>
 #include <napi.h>
+#include <uv.h>
 
 struct Addon;
 class Database;
@@ -29,6 +32,7 @@ class Backup;
 #include "util/row-builder.hpp"
 #include "objects/backup.hpp"
 #include "objects/statement.hpp"
+#include "objects/write-coordinator.hpp"
 #include "objects/database.hpp"
 #include "addon.cpp"
 #include "objects/statement-iterator.hpp"
@@ -44,6 +48,7 @@ class Backup;
 #include "objects/backup.cpp"
 #include "objects/statement.cpp"
 #include "objects/database.cpp"
+#include "objects/write-coordinator.cpp"
 #include "objects/statement-iterator.cpp"
 
 Napi::Object InitAll(Napi::Env env, Napi::Object exports) {

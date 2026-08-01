@@ -1,4 +1,11 @@
 class QueuedAsyncWorker;
+class WriteCoordinator;
+
+struct OpenOptions {
+	bool readonly;
+	bool in_memory;
+	std::string pragmaProfile;
+};
 
 class Database : public Napi::ObjectWrap<Database> {
 public:
@@ -44,7 +51,9 @@ public:
 
 	// Queue asynchronous write workers so a connection is never used concurrently.
 	void EnqueueAsync(QueuedAsyncWorker* worker);
+	void EnqueueWriteAsync(QueuedAsyncWorker* worker);
 	void FinishAsync();
+	void FinishWriteAsync();
 
 	// A view for Statements to see and modify Database state.
 	// The order of these fields must exactly match their actual order.
@@ -88,6 +97,8 @@ private:
 	static NODE_GETTER(JS_inTransaction);
 
 	static bool Deserialize(Napi::Env env, Napi::Object buffer, Addon* addon, sqlite3* db_handle, bool readonly);
+	static void ExecPragmaChecked(sqlite3* db_handle, const char* sql);
+	static void ApplyDefaultPragmas(sqlite3* db_handle, const OpenOptions& options);
 	static void FreeSerialization(Napi::Env env, char* data);
 
 	static const int MAX_BUFFER_SIZE;
@@ -107,20 +118,28 @@ private:
 	std::set<Statement*, CompareStatement> stmts;
 	std::set<Backup*, CompareBackup> backups;
 	std::deque<QueuedAsyncWorker*> async_queue;
+	std::string file_id;
+	std::shared_ptr<WriteCoordinator> write_coordinator;
 };
 
 class QueuedAsyncWorker : public Napi::AsyncWorker {
 public:
 	QueuedAsyncWorker(Napi::Env env, Database* db, Napi::Object owner)
-		: Napi::AsyncWorker(env), deferred(Napi::Promise::Deferred::New(env)), db(db), owner(Napi::Persistent(owner)) {}
+		: Napi::AsyncWorker(env), deferred(Napi::Promise::Deferred::New(env)), db(db), owner(Napi::Persistent(owner)), write_coordinated(false) {}
 
 	Napi::Promise Promise() { return deferred.Promise(); }
 	void QueueWork() { Napi::AsyncWorker::Queue(); }
+	Database* GetDatabase() { return db; }
+	void MarkWriteCoordinated() { write_coordinated = true; }
 
 protected:
-	void FinishQueue() { db->FinishAsync(); }
+	void FinishQueue() {
+		db->FinishAsync();
+		if (write_coordinated) db->FinishWriteAsync();
+	}
 
 	Napi::Promise::Deferred deferred;
 	Database* db;
 	Napi::ObjectReference owner;
+	bool write_coordinated;
 };
