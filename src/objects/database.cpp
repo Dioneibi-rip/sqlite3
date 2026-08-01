@@ -24,7 +24,9 @@ Database::Database(const Napi::CallbackInfo& info) :
 	logger(),
 	stmts(),
 	backups(),
-	async_queue() {
+	async_queue(),
+	file_id(),
+	write_coordinator() {
 	napi_status status = napi_type_tag_object(info.Env(), info.This(), &TYPE_TAG);
 	assert(status == napi_ok); ((void)status);
 	JS_new(info);
@@ -123,6 +125,89 @@ void Database::FreeSerialization(Napi::Env env, char* data) {
 	sqlite3_free(data);
 }
 
+static thread_local int pragma_error_code = SQLITE_OK;
+static thread_local std::string pragma_error_message;
+
+static void SetPragmaError(sqlite3* db_handle, const std::string& message) {
+	if (pragma_error_code == SQLITE_OK) {
+		pragma_error_code = sqlite3_extended_errcode(db_handle);
+		pragma_error_message = message;
+	}
+}
+
+static bool HasPragmaError() {
+	return pragma_error_code != SQLITE_OK;
+}
+
+static void ClearPragmaError() {
+	pragma_error_code = SQLITE_OK;
+	pragma_error_message.clear();
+}
+
+void Database::ExecPragmaChecked(sqlite3* db_handle, const char* sql) {
+	char* error = NULL;
+	int status = sqlite3_exec(db_handle, sql, NULL, NULL, &error);
+	if (status != SQLITE_OK) {
+		std::string message = error ? error : sqlite3_errmsg(db_handle);
+		if (error) sqlite3_free(error);
+		message += " while executing ";
+		message += sql;
+		SetPragmaError(db_handle, message);
+		return;
+	}
+}
+
+void Database::ApplyDefaultPragmas(sqlite3* db_handle, const OpenOptions& options) {
+	if (options.pragmaProfile != "ruby-hoshino") return;
+
+	sqlite3_stmt* statement = NULL;
+	const char* journal_mode_sql = "PRAGMA journal_mode = WAL;";
+	int status = sqlite3_prepare_v2(db_handle, journal_mode_sql, -1, &statement, NULL);
+	if (status != SQLITE_OK) {
+		std::string message = sqlite3_errmsg(db_handle);
+		message += " while executing ";
+		message += journal_mode_sql;
+		SetPragmaError(db_handle, message);
+		return;
+	}
+
+	status = sqlite3_step(statement);
+	std::string journal_mode;
+	if (status == SQLITE_ROW) {
+		const unsigned char* text = sqlite3_column_text(statement, 0);
+		if (text) journal_mode = reinterpret_cast<const char*>(text);
+	} else if (status != SQLITE_DONE) {
+		std::string message = sqlite3_errmsg(db_handle);
+		message += " while executing ";
+		message += journal_mode_sql;
+		sqlite3_finalize(statement);
+		SetPragmaError(db_handle, message);
+		return;
+	}
+
+	status = sqlite3_finalize(statement);
+	if (status != SQLITE_OK) {
+		std::string message = sqlite3_errmsg(db_handle);
+		message += " while executing ";
+		message += journal_mode_sql;
+		SetPragmaError(db_handle, message);
+		return;
+	}
+
+	std::transform(journal_mode.begin(), journal_mode.end(), journal_mode.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	if (!options.readonly && !options.in_memory && journal_mode != "wal") {
+		std::string message = "PRAGMA journal_mode = WAL returned ";
+		message += journal_mode.empty() ? "no journal mode" : journal_mode;
+		SetPragmaError(db_handle, message);
+		return;
+	}
+
+	ExecPragmaChecked(db_handle, "PRAGMA synchronous = NORMAL;");
+	ExecPragmaChecked(db_handle, "PRAGMA temp_store = MEMORY;");
+	ExecPragmaChecked(db_handle, "PRAGMA mmap_size = 268435456;");
+	ExecPragmaChecked(db_handle, "PRAGMA foreign_keys = ON;");
+}
+
 void Database::EnqueueAsync(QueuedAsyncWorker* worker) {
 	if (async_busy) {
 		async_queue.push_back(worker);
@@ -130,6 +215,10 @@ void Database::EnqueueAsync(QueuedAsyncWorker* worker) {
 		async_busy = true;
 		worker->QueueWork();
 	}
+}
+
+void Database::EnqueueWriteAsync(QueuedAsyncWorker* worker) {
+	write_coordinator->Enqueue(worker);
 }
 
 void Database::FinishAsync() {
@@ -140,6 +229,10 @@ void Database::FinishAsync() {
 	} else {
 		async_busy = false;
 	}
+}
+
+void Database::FinishWriteAsync() {
+	write_coordinator->Finish();
 }
 
 class ExecAsyncWorker : public QueuedAsyncWorker {
@@ -220,6 +313,7 @@ NODE_METHOD(Database::JS_new) {
 	REQUIRE_ARGUMENT_INT32(sixth, int timeout);
 	REQUIRE_ARGUMENT_ANY(seventh, Napi::Value logger);
 	REQUIRE_ARGUMENT_ANY(eighth, Napi::Value buffer);
+	REQUIRE_ARGUMENT_OBJECT(ninth, Napi::Object nativeOptions);
 
 	UseAddon;
 	UseIsolate;
@@ -237,13 +331,27 @@ NODE_METHOD(Database::JS_new) {
 	}
 
 	assert(sqlite3_db_mutex(db_handle) == NULL);
-	static const char* pragmas =
-		"PRAGMA journal_mode = WAL;"
-		"PRAGMA synchronous = NORMAL;"
-		"PRAGMA temp_store = MEMORY;"
-		"PRAGMA mmap_size = 268435456;";
-	sqlite3_exec(db_handle, pragmas, NULL, NULL, NULL);
 	sqlite3_extended_result_codes(db_handle, 1);
+
+	OpenOptions open_options;
+	open_options.readonly = readonly;
+	open_options.in_memory = in_memory;
+	Napi::Value pragmaProfile = nativeOptions.Get("profile");
+	open_options.pragmaProfile = pragmaProfile.IsString() ? pragmaProfile.As<Napi::String>().Utf8Value() : "default";
+
+	ClearPragmaError();
+	ApplyDefaultPragmas(db_handle, open_options);
+	if (HasPragmaError()) {
+		ThrowSqliteError(env, addon, pragma_error_message.c_str(), pragma_error_code);
+		ClearPragmaError();
+		int status = sqlite3_close(db_handle);
+		assert(status == SQLITE_OK); ((void)status);
+		return env.Undefined();
+	}
+	ClearPragmaError();
+	const char* db_filename = sqlite3_db_filename(db_handle, "main");
+	file_id = db_filename != NULL && db_filename[0] != '\0' ? db_filename : utf8;
+	write_coordinator = WriteCoordinator::ForFile(env, file_id);
 	sqlite3_busy_timeout(db_handle, timeout);
 	sqlite3_limit(db_handle, SQLITE_LIMIT_LENGTH, MAX_BUFFER_SIZE < MAX_STRING_SIZE ? MAX_BUFFER_SIZE : MAX_STRING_SIZE);
 	sqlite3_limit(db_handle, SQLITE_LIMIT_SQL_LENGTH, MAX_STRING_SIZE);
