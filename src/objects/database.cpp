@@ -231,8 +231,8 @@ void Database::FinishAsync() {
 	}
 }
 
-void Database::FinishWriteAsync() {
-	write_coordinator->Finish();
+void Database::FinishWriteAsync(QueuedAsyncWorker* worker) {
+	write_coordinator->Finish(worker);
 }
 
 class ExecAsyncWorker : public QueuedAsyncWorker {

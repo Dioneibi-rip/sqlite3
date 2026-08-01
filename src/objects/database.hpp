@@ -53,7 +53,7 @@ public:
 	void EnqueueAsync(QueuedAsyncWorker* worker);
 	void EnqueueWriteAsync(QueuedAsyncWorker* worker);
 	void FinishAsync();
-	void FinishWriteAsync();
+	void FinishWriteAsync(QueuedAsyncWorker* worker);
 
 	// A view for Statements to see and modify Database state.
 	// The order of these fields must exactly match their actual order.
@@ -131,11 +131,12 @@ public:
 	void QueueWork() { Napi::AsyncWorker::Queue(); }
 	Database* GetDatabase() { return db; }
 	void MarkWriteCoordinated() { write_coordinated = true; }
+	Napi::Object Owner() { return owner.Value(); }
 
 protected:
 	void FinishQueue() {
 		db->FinishAsync();
-		if (write_coordinated) db->FinishWriteAsync();
+		if (write_coordinated) db->FinishWriteAsync(this);
 	}
 
 	Napi::Promise::Deferred deferred;
