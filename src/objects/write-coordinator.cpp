@@ -59,6 +59,7 @@ WriteCoordinator::WriteCoordinator(Napi::Env env, std::string file_id) :
 	idle_owner() {
 	napi_get_uv_event_loop(env, &loop);
 	uv_timer_init(loop, &timer);
+	uv_unref(reinterpret_cast<uv_handle_t*>(&timer));
 	timer.data = this;
 }
 
@@ -84,6 +85,7 @@ void WriteCoordinator::Finish(QueuedAsyncWorker* worker) {
 
 void WriteCoordinator::OnTimer(uv_timer_t* handle) {
 	WriteCoordinator* coordinator = static_cast<WriteCoordinator*>(handle->data);
+	Napi::HandleScope scope(coordinator->env);
 	coordinator->timer_active = false;
 	if (coordinator->idle_timer_pending) {
 		coordinator->idle_timer_pending = false;
