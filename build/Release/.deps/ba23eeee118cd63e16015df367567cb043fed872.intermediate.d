@@ -1,0 +1,1 @@
+cmd_ba23eeee118cd63e16015df367567cb043fed872.intermediate := LD_LIBRARY_PATH=/vercel/share/v0-project/build/Release/lib.host:/vercel/share/v0-project/build/Release/lib.target:$$LD_LIBRARY_PATH; export LD_LIBRARY_PATH; cd ../deps; mkdir -p /vercel/share/v0-project/build/Release/obj/gen/sqlite3; node copy.js "/vercel/share/v0-project/build/Release/obj/gen/sqlite3" ""
