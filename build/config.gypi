@@ -503,16 +503,9 @@
     "nodedir": "/home/vercel-sandbox/.cache/node-gyp/24.16.0",
     "python": "/usr/local/bin/python3",
     "standalone_static_library": 1,
-    "npm_globalconfig": "/usr/local/etc/npmrc",
+    "force_build": "1",
     "verify_deps_before_run": "false",
-    "_jsr_registry": "https://npm.jsr.io/",
-    "globalconfig": "/home/vercel-sandbox/.config/pnpm/rc",
-    "confirmModulesPurge": "",
-    "frozen_lockfile": "",
-    "prefer_offline": "true",
-    "user_agent": "pnpm/10.34.3 npm/? node/v24.16.0 linux x64",
-    "node_gyp": "/home/vercel-sandbox/.cache/node/corepack/v1/pnpm/10.34.3/dist/node_modules/node-gyp/bin/node-gyp.js",
-    "registry": "https://registry.npmjs.org/"
+    "user_agent": "pnpm/10.34.3 npm/? node/v24.16.0 linux x64"
   },
   "target_defaults": {
     "include_dirs": [],

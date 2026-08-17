@@ -18,7 +18,14 @@
           'dependencies': ['deps/sqlite3.gyp:sqlite3'],
           'sources': ['src/better_sqlite3.cpp'],
           'include_dirs': ["<!@(node -p \"require('node-addon-api').include\")"],
-          'defines': ['NAPI_VERSION=8', 'NODE_ADDON_API_DISABLE_CPP_EXCEPTIONS'],
+          # NAPI_VERSION must stay >= 10. Node-API rejects napi_create_reference
+          # on non-object values for modules that declare an older version, which
+          # breaks named parameters (BindMap holds Napi::String references) and
+          # aggregate seeds/accumulators (references to arbitrary values). Both
+          # surface at runtime as "Error: Invalid argument".
+          # NAPI_DISABLE_CPP_EXCEPTIONS is the macro node-addon-api actually
+          # checks; NODE_ADDON_API_DISABLE_CPP_EXCEPTIONS does not exist.
+          'defines': ['NAPI_VERSION=10', 'NAPI_DISABLE_CPP_EXCEPTIONS'],
           'cflags_cc': ['-std=c++20', '-fvisibility=hidden', '-fvisibility-inlines-hidden', '-flto'],
           'ldflags': ['-flto'],
           'xcode_settings': {
