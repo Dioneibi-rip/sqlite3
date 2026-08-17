@@ -26,7 +26,8 @@
     "src/**/*.[ch]pp",
     "lib/**",
     "deps/**",
-    "prebuilds/**"
+    "prebuilds/**",
+    "scripts/install.js"
   ],
   "engines": {
     "node": ">=20.3.0"
@@ -45,6 +46,7 @@
     "sqlite3": "^5.1.6"
   },
   "scripts": {
+    "install": "node scripts/install.js",
     "build-release": "node-gyp clean && node-gyp rebuild --release --force_build=1",
     "build-debug": "node-gyp clean && node-gyp rebuild --debug --force_build=1",
     "test": "mocha --exit --slow=75 --timeout=5000",
