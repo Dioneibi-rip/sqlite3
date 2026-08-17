@@ -42,6 +42,7 @@
     "mocha": "^11.7.5",
     "node-gyp": "^10.3.1",
     "nodemark": "^0.3.0",
+    "prebuildify": "^6.0.1",
     "sqlite": "^5.0.1",
     "sqlite3": "^5.1.6"
   },
@@ -52,7 +53,8 @@
     "test": "mocha --exit --slow=75 --timeout=5000",
     "benchmark": "node benchmark",
     "download": "bash ./deps/download.sh",
-    "clean": "rm -rf node_modules build prebuilds"
+    "clean": "rm -rf node_modules build prebuilds",
+    "prebuild": "prebuildify --napi --strip --tag-libc"
   },
   "license": "MIT",
   "keywords": [

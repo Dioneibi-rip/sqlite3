@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Local native build output (node-gyp)
+build/
+out/
+Release/
+Debug/
+*.o
+*.obj
+*.node.dSYM/
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Prebuilt binaries are produced by CI (prebuild.yml), never committed by hand.
+# A stale committed prebuild silently shadows your local build/Release output.
+prebuilds/
+
+# Test + benchmark scratch space
+temp/
+.nyc_output/
+coverage/
+
+# Downloaded SQLite amalgamation
+deps/sqlite3/
+deps/sqlite-*/
+deps/*.zip
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

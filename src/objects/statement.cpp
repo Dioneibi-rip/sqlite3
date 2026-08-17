@@ -361,6 +361,14 @@ namespace {
 				if (status == SQLITE_ROW || status == SQLITE_DONE) status = sqlite3_reset(handle);
 				else sqlite3_reset(handle);
 			}
+			// Snapshot the failure before the ROLLBACK/RELEASE sqlite3_exec() calls
+			// below clear the connection's error state.
+			bool captured = false;
+			if (status != SQLITE_OK) {
+				code = sqlite3_extended_errcode(db_handle);
+				message = sqlite3_errmsg(db_handle);
+				captured = true;
+			}
 			if (status == SQLITE_OK && write) status = ExecSql(db_handle, "RELEASE SAVEPOINT __ruby_hoshino_job;");
 			else if (write && savepoint_started) {
 				ExecSql(db_handle, "ROLLBACK TO SAVEPOINT __ruby_hoshino_job;");
@@ -369,8 +377,10 @@ namespace {
 			if (status == SQLITE_OK && transaction_started) status = ExecSql(db_handle, "COMMIT;");
 			else if (transaction_started) ExecSql(db_handle, "ROLLBACK;");
 			if (status != SQLITE_OK) {
-				code = sqlite3_extended_errcode(db_handle);
-				message = sqlite3_errmsg(db_handle);
+				if (!captured) {
+					code = sqlite3_extended_errcode(db_handle);
+					message = sqlite3_errmsg(db_handle);
+				}
 				SetError(message);
 			}
 			if (!bound) sqlite3_clear_bindings(handle);
@@ -502,10 +512,24 @@ namespace {
 				}
 			}
 			if (status == SQLITE_OK) {
-				sqlite3_step(handle);
-				status = sqlite3_reset(handle);
+				// sqlite3_step() reports the real failure (constraint violations,
+				// etc). sqlite3_reset() repeats it, but only keep the reset status
+				// when step succeeded, so the original error code survives.
+				int step_status = sqlite3_step(handle);
+				int reset_status = sqlite3_reset(handle);
+				if (step_status == SQLITE_DONE || step_status == SQLITE_ROW) status = reset_status;
+				else status = step_status;
 			} else {
 				sqlite3_reset(handle);
+			}
+			// Snapshot the failure now. The ROLLBACK/RELEASE statements below run
+			// their own sqlite3_exec() calls, which reset the connection's error
+			// state and would otherwise turn a real error into SQLITE_OK.
+			bool captured = false;
+			if (status != SQLITE_OK) {
+				code = sqlite3_extended_errcode(db_handle);
+				message = sqlite3_errmsg(db_handle);
+				captured = true;
 			}
 			if (status == SQLITE_OK && write) status = ExecSql(db_handle, "RELEASE SAVEPOINT __ruby_hoshino_job;");
 			else if (write && savepoint_started) {
@@ -518,15 +542,17 @@ namespace {
 				changes = sqlite3_total_changes(db_handle) == total_changes_before ? 0 : sqlite3_changes(db_handle);
 				id = sqlite3_last_insert_rowid(db_handle);
 			} else {
-				code = sqlite3_extended_errcode(db_handle);
-				message = sqlite3_errmsg(db_handle);
+				if (!captured) {
+					code = sqlite3_extended_errcode(db_handle);
+					message = sqlite3_errmsg(db_handle);
+				}
 				SetError(message);
 			}
 			if (!bound) sqlite3_clear_bindings(handle);
 		}
 
 		void OnOK() override {
-			stmt->SetLocked(false);
+			if (stmt_handle.IsExclusive()) stmt->SetLocked(false);
 			Napi::Object result = Napi::Object::New(Env());
 			result.Set(db->GetAddon()->cs.changes.Value(Env()), Napi::Number::New(Env(), changes));
 			if (safe_ints) result.Set(db->GetAddon()->cs.lastInsertRowid.Value(Env()), Napi::BigInt::New(Env(), (int64_t)id));
@@ -536,7 +562,7 @@ namespace {
 		}
 
 		void OnError(const Napi::Error& error) override {
-			stmt->SetLocked(false);
+			if (stmt_handle.IsExclusive()) stmt->SetLocked(false);
 			Napi::Object err = error.Value();
 			err.Set("code", db->GetAddon()->cs.Code(Env(), code));
 			deferred.Reject(err);
@@ -569,6 +595,7 @@ namespace {
 		int status;
 		int code;
 		std::string message;
+		AsyncHandle stmt_handle;
 	};
 }
 
@@ -990,7 +1017,6 @@ NODE_METHOD(Statement::JS_getAsync) {
 	Database* db = stmt->db;
 	REQUIRE_DATABASE_OPEN(db->GetState());
 	if (db->GetState()->busy) return ThrowTypeError(info.Env(), "This database connection is busy executing a query");
-	REQUIRE_STATEMENT_NOT_LOCKED(stmt);
 	if (db->GetState()->has_logger) return ThrowTypeError(info.Env(), "getAsync() cannot be used while verbose logging is enabled");
 	const bool bound = stmt->bound;
 	std::vector<AsyncBindValue> values;
@@ -1002,9 +1028,10 @@ NODE_METHOD(Statement::JS_getAsync) {
 	}
 
 	bool write = sqlite3_stmt_readonly(handle) == 0;
-	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, true, write);
+	const bool exclusive = !stmt->IsLocked();
+	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, true, write, exclusive);
 	Napi::Promise promise = worker->Promise();
-	stmt->SetLocked(true);
+	if (exclusive) stmt->SetLocked(true);
 	if (write) db->EnqueueWriteAsync(worker);
 	else db->EnqueueAsync(worker);
 	return promise;
@@ -1061,7 +1088,6 @@ NODE_METHOD(Statement::JS_allAsync) {
 	Database* db = stmt->db;
 	REQUIRE_DATABASE_OPEN(db->GetState());
 	if (db->GetState()->busy) return ThrowTypeError(info.Env(), "This database connection is busy executing a query");
-	REQUIRE_STATEMENT_NOT_LOCKED(stmt);
 	if (db->GetState()->has_logger) return ThrowTypeError(info.Env(), "allAsync() cannot be used while verbose logging is enabled");
 	const bool bound = stmt->bound;
 	std::vector<AsyncBindValue> values;
@@ -1073,9 +1099,10 @@ NODE_METHOD(Statement::JS_allAsync) {
 	}
 
 	bool write = sqlite3_stmt_readonly(handle) == 0;
-	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, false, write);
+	const bool exclusive = !stmt->IsLocked();
+	AsyncReaderWorker* worker = new AsyncReaderWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, false, write, exclusive);
 	Napi::Promise promise = worker->Promise();
-	stmt->SetLocked(true);
+	if (exclusive) stmt->SetLocked(true);
 	if (write) db->EnqueueWriteAsync(worker);
 	else db->EnqueueAsync(worker);
 	return promise;
@@ -1111,7 +1138,6 @@ NODE_METHOD(Statement::JS_runAsync) {
 	Database* db = stmt->db;
 	REQUIRE_DATABASE_OPEN(db->GetState());
 	if (db->GetState()->busy) return ThrowTypeError(info.Env(), "This database connection is busy executing a query");
-	REQUIRE_STATEMENT_NOT_LOCKED(stmt);
 	REQUIRE_DATABASE_NO_ITERATORS_UNLESS_UNSAFE(db->GetState());
 	if (db->GetState()->has_logger) return ThrowTypeError(info.Env(), "runAsync() cannot be used while verbose logging is enabled");
 	const bool bound = stmt->bound;
@@ -1124,9 +1150,10 @@ NODE_METHOD(Statement::JS_runAsync) {
 	}
 
 	bool write = sqlite3_stmt_readonly(handle) == 0;
-	RunAsyncWorker* worker = new RunAsyncWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, write);
+	const bool exclusive = !stmt->IsLocked();
+	RunAsyncWorker* worker = new RunAsyncWorker(info.Env(), db, info.This().As<Napi::Object>(), stmt, std::move(values), bound, write, exclusive);
 	Napi::Promise promise = worker->Promise();
-	stmt->SetLocked(true);
+	if (exclusive) stmt->SetLocked(true);
 	if (write) db->EnqueueWriteAsync(worker);
 	else db->EnqueueAsync(worker);
 	return promise;
