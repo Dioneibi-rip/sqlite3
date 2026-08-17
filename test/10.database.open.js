@@ -119,9 +119,12 @@ describe('new Database()', function () {
 	});
 	it('should accept the "nativeBinding" option', function () {
 		this.slow(500);
+		// The default binding resolves prebuilds/ before build/, so ask lib/binding.js
+		// which file it actually loads instead of assuming build/{Debug,Release}.
+		const { getPrebuildPath } = require('../lib/binding.js');
 		const configuration = fs.existsSync(path.resolve('build/Debug/better_sqlite3.node')) ? 'Debug' : 'Release';
-		const oldBinding = path.resolve(`build/${configuration}/better_sqlite3.node`);
-		const newBinding = path.join(path.dirname(oldBinding), 'test.node');
+		const oldBinding = getPrebuildPath() || path.resolve(`build/${configuration}/better_sqlite3.node`);
+		const newBinding = path.resolve(`build/${configuration}/test.node`);
 		expect(oldBinding).to.be.a('string');
 		fs.copyFileSync(oldBinding, newBinding);
 		const getBinding = db => db[Object.getOwnPropertySymbols(db)[0]].constructor;
