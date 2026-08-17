@@ -504,8 +504,16 @@
     "python": "/usr/local/bin/python3",
     "standalone_static_library": 1,
     "force_build": "1",
-    "verify_deps_before_run": "false",
-    "user_agent": "pnpm/10.34.3 npm/? node/v24.16.0 linux x64"
+    "userconfig": "/home/vercel-sandbox/.npmrc",
+    "cache": "/home/vercel-sandbox/.npm",
+    "local_prefix": "/vercel/share/v0-project",
+    "globalconfig": "/usr/local/etc/npmrc",
+    "init_module": "/home/vercel-sandbox/.npm-init.js",
+    "npm_version": "11.13.0",
+    "prefix": "/usr/local",
+    "user_agent": "npm/11.13.0 node/v24.16.0 linux x64 workspaces/false",
+    "node_gyp": "/usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js",
+    "global_prefix": "/usr/local"
   },
   "target_defaults": {
     "include_dirs": [],
