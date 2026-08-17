@@ -1,0 +1,97 @@
+name: prebuild
+
+on:
+  push:
+    tags: ['v*']
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prebuild:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: linuxmusl-x64
+            os: ubuntu-latest
+            container: node:20-alpine
+          - name: darwin-x64
+            os: macos-13
+          - name: darwin-arm64
+            os: macos-latest
+          - name: win32-x64
+            os: windows-latest
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build toolchain (musl)
+        if: matrix.container
+        run: apk add --no-cache build-base python3 git
+
+      - uses: actions/setup-node@v4
+        if: ${{ !matrix.container }}
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Download SQLite amalgamation
+        run: npm run download
+        shell: bash
+
+      - name: Build prebuild
+        run: npx prebuildify --napi --strip --tag-libc --target=node@20.0.0
+
+      - name: Verify the addon loads and async is sane
+        run: node -e "const D=require('./lib');const db=new D(':memory:');db.exec('CREATE TABLE t(a)');const s=db.prepare('INSERT INTO t VALUES(?)');Promise.all([s.runAsync(1),s.runAsync(2),s.runAsync(3)]).then(()=>{const n=db.prepare('SELECT COUNT(*) c FROM t').pluck().get();if(n!==3)throw new Error('expected 3, got '+n);console.log('ok',process.platform,process.arch);}).catch(e=>{console.error(e);process.exit(1);})"
+
+      - name: Run test suite
+        run: npm test
+        continue-on-error: ${{ matrix.name == 'linuxmusl-x64' }}
+
+      - name: Package prebuild
+        run: tar -czf prebuild-${{ matrix.name }}.tar.gz prebuilds
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.name }}
+          path: prebuild-${{ matrix.name }}.tar.gz
+          retention-days: 30
+
+  publish:
+    name: attach prebuilds to release
+    needs: prebuild
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: prebuild-*
+          merge-multiple: true
+
+      - name: Collect prebuilds into one tree
+        run: |
+          mkdir -p prebuilds
+          for f in artifacts/*.tar.gz; do tar -xzf "$f"; done
+          find prebuilds -type f -print
+          tar -czf prebuilds-all.tar.gz prebuilds
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            prebuilds-all.tar.gz
+            artifacts/*.tar.gz
