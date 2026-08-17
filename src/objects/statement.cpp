@@ -281,14 +281,56 @@ namespace {
 		}
 	}
 
+	// Lets several asynchronous jobs share a single Statement object. The first job
+	// in flight is "exclusive" and runs on the Statement's own sqlite3_stmt. A job
+	// that starts while an earlier one is still running compiles a private handle
+	// from the same SQL, so overlapping calls queue on the database instead of
+	// failing with "This statement is busy executing a query".
+	class AsyncHandle {
+	public:
+		AsyncHandle(Statement* stmt, bool exclusive)
+			: shared(stmt->GetHandle()), exclusive(exclusive), handle(NULL) {
+			if (!exclusive) {
+				const char* text = sqlite3_sql(shared);
+				if (text != NULL) sql = text;
+			}
+		}
+
+		~AsyncHandle() {
+			if (handle != NULL) sqlite3_finalize(handle);
+		}
+
+		int Acquire(sqlite3* db_handle) {
+			if (exclusive) return SQLITE_OK;
+			if (sql.empty()) return SQLITE_MISUSE;
+			return sqlite3_prepare_v2(db_handle, sql.c_str(), -1, &handle, NULL);
+		}
+
+		sqlite3_stmt* Get() const { return exclusive ? shared : handle; }
+		bool IsExclusive() const { return exclusive; }
+
+	private:
+		sqlite3_stmt* shared;
+		std::string sql;
+		bool exclusive;
+		sqlite3_stmt* handle;
+	};
+
 	class AsyncReaderWorker : public QueuedAsyncWorker {
 	public:
-		AsyncReaderWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound, bool single, bool write)
-			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), single(single), write(write), safe_ints(stmt->IsSafeIntegers()), mode(stmt->GetMode()), column_count(0), status(SQLITE_OK), code(SQLITE_OK) {}
+		AsyncReaderWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound, bool single, bool write, bool exclusive)
+			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), single(single), write(write), safe_ints(stmt->IsSafeIntegers()), mode(stmt->GetMode()), column_count(0), status(SQLITE_OK), code(SQLITE_OK), stmt_handle(stmt, exclusive) {}
 
 		void Execute() override {
-			sqlite3_stmt* handle = stmt->GetHandle();
 			sqlite3* db_handle = db->GetHandle();
+			status = stmt_handle.Acquire(db_handle);
+			if (status != SQLITE_OK) {
+				code = sqlite3_extended_errcode(db_handle);
+				message = sqlite3_errmsg(db_handle);
+				SetError(message);
+				return;
+			}
+			sqlite3_stmt* handle = stmt_handle.Get();
 			bool transaction_started = false;
 			bool savepoint_started = false;
 			bool autocommit = sqlite3_get_autocommit(db_handle) != 0;
@@ -335,7 +377,7 @@ namespace {
 		}
 
 		void OnOK() override {
-			stmt->SetLocked(false);
+			if (stmt_handle.IsExclusive()) stmt->SetLocked(false);
 			if (single) {
 				deferred.Resolve(rows.empty() ? Env().Undefined() : RowToJS(rows[0]));
 			} else {
@@ -347,7 +389,7 @@ namespace {
 		}
 
 		void OnError(const Napi::Error& error) override {
-			stmt->SetLocked(false);
+			if (stmt_handle.IsExclusive()) stmt->SetLocked(false);
 			Napi::Object err = error.Value();
 			err.Set("code", db->GetAddon()->cs.Code(Env(), code));
 			deferred.Reject(err);
@@ -423,16 +465,24 @@ namespace {
 		int status;
 		int code;
 		std::string message;
+		AsyncHandle stmt_handle;
 	};
 
 	class RunAsyncWorker : public QueuedAsyncWorker {
 	public:
-		RunAsyncWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound, bool write)
-			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), write(write), changes(0), id(0), safe_ints(stmt->IsSafeIntegers()), status(SQLITE_OK), code(SQLITE_OK) {}
+		RunAsyncWorker(Napi::Env env, Database* db, Napi::Object owner, Statement* stmt, std::vector<AsyncBindValue> values, bool bound, bool write, bool exclusive)
+			: QueuedAsyncWorker(env, db, owner), stmt(stmt), values(std::move(values)), bound(bound), write(write), changes(0), id(0), safe_ints(stmt->IsSafeIntegers()), status(SQLITE_OK), code(SQLITE_OK), stmt_handle(stmt, exclusive) {}
 
 		void Execute() override {
-			sqlite3_stmt* handle = stmt->GetHandle();
 			sqlite3* db_handle = db->GetHandle();
+			status = stmt_handle.Acquire(db_handle);
+			if (status != SQLITE_OK) {
+				code = sqlite3_extended_errcode(db_handle);
+				message = sqlite3_errmsg(db_handle);
+				SetError(message);
+				return;
+			}
+			sqlite3_stmt* handle = stmt_handle.Get();
 			int total_changes_before = sqlite3_total_changes(db_handle);
 			bool transaction_started = false;
 			bool savepoint_started = false;

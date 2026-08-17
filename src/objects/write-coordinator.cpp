@@ -72,9 +72,17 @@ WriteCoordinator::~WriteCoordinator() {
 void WriteCoordinator::Enqueue(QueuedAsyncWorker* worker) {
 	CancelIdleTimer();
 	queue.push_back(worker);
-	if (active || timer_active) return;
-	timer_active = true;
-	uv_timer_start(&timer, WriteCoordinator::OnTimer, 5, 0);
+	if (active) return;
+	// Dispatch synchronously instead of waiting on a timer. Arming a timer added a
+	// fixed delay to every write, and because the timer is unref'd (so it can never
+	// hold the process open on its own) a pending write was silently dropped when it
+	// was the only thing left on the loop. Flush() hands the worker to
+	// Napi::AsyncWorker::Queue(), which refs the loop until the write completes.
+	if (timer_active) {
+		uv_timer_stop(&timer);
+		timer_active = false;
+	}
+	Flush();
 }
 
 void WriteCoordinator::Finish(QueuedAsyncWorker* worker) {
